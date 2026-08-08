@@ -1,0 +1,13 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Drone Harness Fixtures",
+  "Description": "Deterministic visual target fixture for AirSim harness E2E tests.",
+  "Category": "Testing",
+  "EnabledByDefault": true,
+  "CanContainContent": false,
+  "Modules": [
+    {"Name": "DroneHarnessFixtures", "Type": "Runtime", "LoadingPhase": "PostEngineInit"}
+  ]
+}

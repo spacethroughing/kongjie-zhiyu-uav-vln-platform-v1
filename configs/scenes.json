@@ -1,0 +1,98 @@
+{
+  "scenes": [
+    {
+      "id": "mock",
+      "name": "Mock E2E（无需 UE）",
+      "mode": "mock",
+      "vehicle_name": "Drone1",
+      "zones": [
+        {
+          "id": "mock-fixture",
+          "name": "合成目标测试区",
+          "polygon": {"points": [[-15, -15], [25, -15], [25, 25], [-15, 25]]},
+          "search_altitude_m": 5,
+          "lane_spacing_m": 10,
+          "observation_yaws_deg": [0, 90, 180, 270]
+        }
+      ],
+      "safety": {
+        "min_altitude_m": 2,
+        "max_altitude_m": 15,
+        "max_speed_mps": 8,
+        "approach_speed_mps": 4,
+        "min_standoff_m": 3,
+        "min_clearance_m": 1.5,
+        "max_mission_seconds": 300,
+        "telemetry_stale_seconds": 1.5,
+        "no_fly_zones": []
+      }
+    },
+    {
+      "id": "blocks",
+      "name": "AirSim Blocks",
+      "mode": "editor",
+      "executable": "D:\\UE_4.27\\Engine\\Binaries\\Win64\\UE4Editor.exe",
+      "project": "E:\\C\\AirSim\\Unreal\\Environments\\Blocks\\Blocks.uproject",
+      "settings": "C:\\Users\\Mingyi Liu\\Documents\\Codex\\2026-08-08\\new-chat-2\\outputs\\airsim-llm-harness\\configs\\airsim\\blocks.settings.json",
+      "vehicle_name": "Drone1",
+      "bridge_conda_env": "airsim",
+      "launch_args": ["-windowed", "-ResX=1280", "-ResY=720", "-NoSound", "-HarnessFixture"],
+      "checksum_paths": ["E:\\C\\AirSim\\Unreal\\Environments\\Blocks\\Content\\FlyingCPP\\Maps\\FlyingExampleMap.umap"],
+      "zones": [
+        {
+          "id": "blocks-main",
+          "name": "Blocks 主测试区",
+          "polygon": {"points": [[-20, -20], [20, -20], [20, 20], [-20, 20]]},
+          "search_altitude_m": 5,
+          "lane_spacing_m": 8,
+          "observation_yaws_deg": [0, 90, 180, 270]
+        }
+      ],
+      "safety": {
+        "min_altitude_m": 2,
+        "max_altitude_m": 15,
+        "max_speed_mps": 3,
+        "approach_speed_mps": 1,
+        "min_standoff_m": 3,
+        "min_clearance_m": 1.5,
+        "max_mission_seconds": 600,
+        "telemetry_stale_seconds": 1.5,
+        "no_fly_zones": []
+      }
+    },
+    {
+      "id": "citypark",
+      "name": "CityPark Environment",
+      "mode": "editor",
+      "executable": "D:\\UE_4.27\\Engine\\Binaries\\Win64\\UE4Editor.exe",
+      "project": "D:\\CityParkEnvironmentCollec\\CityParkEnvironmentCollec.uproject",
+      "map": "/Game/CityPark/Maps/Showcase?game=/Script/AirSim.AirSimGameMode",
+      "settings": "C:\\Users\\Mingyi Liu\\Documents\\Codex\\2026-08-08\\new-chat-2\\outputs\\airsim-llm-harness\\configs\\airsim\\citypark.settings.json",
+      "vehicle_name": "Drone1",
+      "bridge_conda_env": "airsim",
+      "launch_args": ["-windowed", "-ResX=1280", "-ResY=720", "-NoSound"],
+      "checksum_paths": ["D:\\CityParkEnvironmentCollec\\Content\\CityPark\\Maps\\Showcase.umap"],
+      "zones": [
+        {
+          "id": "citypark-home",
+          "name": "CityPark 起点附近安全区",
+          "polygon": {"points": [[-30, -30], [30, -30], [30, 30], [-30, 30]]},
+          "search_altitude_m": 10,
+          "lane_spacing_m": 10,
+          "observation_yaws_deg": [0, 90, 180, 270]
+        }
+      ],
+      "safety": {
+        "min_altitude_m": 4,
+        "max_altitude_m": 25,
+        "max_speed_mps": 3,
+        "approach_speed_mps": 1,
+        "min_standoff_m": 4,
+        "min_clearance_m": 2,
+        "max_mission_seconds": 900,
+        "telemetry_stale_seconds": 1.5,
+        "no_fly_zones": []
+      }
+    }
+  ]
+}

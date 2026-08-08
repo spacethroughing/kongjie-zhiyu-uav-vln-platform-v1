@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+node_modules/
+frontend/dist/
+frontend/vite.config.js
+frontend/vite.config.d.ts
+*.tsbuildinfo
+runs/
+data/
+runtime/
+*.log
+*.bak

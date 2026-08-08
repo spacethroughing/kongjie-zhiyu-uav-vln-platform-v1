@@ -1,0 +1,25 @@
+{
+  "captured_at": "2026-08-08T12:15:17+08:00",
+  "airsim": {
+    "repository": "E:\\C\\AirSim",
+    "commit": "0b2db65ff1bb78d1a36fd16c71e54de9f0735197",
+    "plugin_version": "1.8.1",
+    "plugin_sha256": "49d03c3e75fb6a9e91fbb7640ab4e8c8834663e12623acfc9bad6b88d28f7e5d"
+  },
+  "unreal": {
+    "root": "D:\\UE_4.27",
+    "version": "4.27.2",
+    "changelist": 18319896,
+    "build_sha256": "98ed2ea52b4b35c5e9d281e97dd5ab38501d389e238fb41cdf4926e0e19b2cc8"
+  },
+  "scenes": {
+    "blocks": {
+      "project_sha256": "2c7dd3b4034d41dd15eb2a4a5c9e3f4127f1a452b3884eb2887c76ccd7526f37",
+      "map_sha256": "a0fa58a356583f8642dba9585315a670e86f719af5358a8fbb1120a067068a84"
+    },
+    "citypark": {
+      "project_sha256": "91328daa2054ec33c2cddda1790e6e20a0eb8e9e37e127d200fe2906a3134adb",
+      "map_sha256": "4341d947eea8b237d3eeecb84204dbec67fa0fb60b1a1019fc70c3fee1e02480"
+    }
+  }
+}
