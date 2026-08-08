@@ -17,11 +17,17 @@ def _point_in_polygon(x: float, y: float, points: list[tuple[float, float]]) -> 
 
 def coverage_route(zone: SearchZone) -> list[RoutePoint]:
     """Create a deterministic boustrophedon route inside a configured polygon."""
-    xs = [point[0] for point in zone.polygon.points]
-    ys = [point[1] for point in zone.polygon.points]
+    coverage = zone.coverage_polygon or zone.polygon
+    xs = [point[0] for point in coverage.points]
+    ys = [point[1] for point in coverage.points]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
     spacing = zone.lane_spacing_m
+    # A half-lane inset keeps the aircraft away from physical walls and props
+    # at the geofence edge while the camera footprint still covers the border.
+    inset = min(spacing / 2, (x_max - x_min) / 4, (y_max - y_min) / 4)
+    x_min, x_max = x_min + inset, x_max - inset
+    y_min, y_max = y_min + inset, y_max - inset
     altitude_z = -abs(zone.search_altitude_m)
     route: list[RoutePoint] = []
     y = y_min
@@ -31,7 +37,7 @@ def coverage_route(zone: SearchZone) -> list[RoutePoint]:
         x = x_min
         sample_step = max(spacing / 2, 0.5)
         while x <= x_max + 1e-6:
-            if _point_in_polygon(x, y, zone.polygon.points):
+            if _point_in_polygon(x, y, coverage.points):
                 samples.append((x, y))
             x += sample_step
         if samples:
@@ -72,4 +78,3 @@ def build_plan(profile: SceneProfile, request: SearchMissionRequest) -> MissionP
             "至少两个不同视角一致后才允许接近",
         ],
     )
-

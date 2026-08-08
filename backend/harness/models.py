@@ -81,11 +81,14 @@ class SearchZone(BaseModel):
     id: str
     name: str
     polygon: Polygon
+    coverage_polygon: Polygon | None = None
     search_altitude_m: float = 5.0
     lane_spacing_m: float = 5.0
     observation_yaws_deg: list[float] = Field(default_factory=lambda: [0, 90, 180, 270])
+    initial_panorama_yaws_deg: list[float] = Field(default_factory=list)
+    initial_verify_baseline_m: float = 4.0
 
-    @field_validator("search_altitude_m", "lane_spacing_m")
+    @field_validator("search_altitude_m", "lane_spacing_m", "initial_verify_baseline_m")
     @classmethod
     def positive(cls, value: float) -> float:
         if value <= 0:

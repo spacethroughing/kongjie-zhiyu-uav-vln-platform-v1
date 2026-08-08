@@ -41,11 +41,14 @@
       "zones": [
         {
           "id": "blocks-main",
-          "name": "Blocks 主测试区",
-          "polygon": {"points": [[-20, -20], [20, -20], [20, 20], [-20, 20]]},
-          "search_altitude_m": 5,
-          "lane_spacing_m": 8,
-          "observation_yaws_deg": [0, 90, 180, 270]
+            "name": "Blocks 主测试区",
+            "polygon": {"points": [[-20, -20], [40, -20], [40, 40], [-20, 40]]},
+            "coverage_polygon": {"points": [[-20, -20], [20, -20], [20, 20], [-20, 20]]},
+            "search_altitude_m": 5,
+            "lane_spacing_m": 8,
+            "observation_yaws_deg": [0, 90, 180, 270],
+            "initial_panorama_yaws_deg": [0, 45, 90, 135, 180, 225, 270, 315],
+            "initial_verify_baseline_m": 4
         }
       ],
       "safety": {

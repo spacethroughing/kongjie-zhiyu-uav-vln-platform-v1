@@ -10,6 +10,7 @@ import json
 import math
 import multiprocessing
 import sys
+import time
 import traceback
 import uuid
 import zlib
@@ -18,41 +19,64 @@ import airsim
 import numpy as np
 
 
-def command_worker(queue):
-    """Own one msgpack event loop and wait for flight futures off the JSONL process."""
+def execute_command(task, issued):
+    """Run one AirSim future on its own msgpack client/event loop."""
     client = airsim.MultirotorClient()
-    while True:
-        task = queue.get()
-        if task is None:
-            return
-        try:
-            operation = task["operation"]
-            vehicle = task["vehicle_name"]
-            if operation == "takeoff":
-                client.takeoffAsync(task["timeout"], vehicle).join()
-            elif operation == "land":
-                client.landAsync(task["timeout"], vehicle).join()
-            elif operation == "hover":
-                client.hoverAsync(vehicle).join()
-            elif operation == "rotate_yaw":
-                client.rotateToYawAsync(
-                    task["yaw_degrees"], task["margin"], task["timeout"], vehicle
-                ).join()
-            elif operation == "move_to":
-                client.moveToPositionAsync(
-                    task["x"],
-                    task["y"],
-                    task["z"],
-                    task["speed"],
-                    task["timeout"],
-                    airsim.DrivetrainType.MaxDegreeOfFreedom,
-                    airsim.YawMode(False, task["yaw_degrees"]),
-                    -1,
-                    1,
-                    vehicle,
-                ).join()
-        except Exception:
-            traceback.print_exc(file=sys.stderr)
+    try:
+        # Establish the socket synchronously so call_async writes the request
+        # before the worker is allowed to process a newer command. Without
+        # this handshake, a slow-to-connect old yaw thread can be issued after
+        # a newer move command and silently supersede it.
+        client.ping()
+        operation = task["operation"]
+        vehicle = task["vehicle_name"]
+        if operation == "move_to":
+            print(
+                "command issue move_to target=%.2f,%.2f,%.2f"
+                % (task["x"], task["y"], task["z"]),
+                file=sys.stderr,
+            )
+        else:
+            print("command issue %s" % operation, file=sys.stderr)
+        if operation == "takeoff":
+            future = client.takeoffAsync(task["timeout"], vehicle)
+        elif operation == "land":
+            future = client.landAsync(task["timeout"], vehicle)
+        elif operation == "hover":
+            future = client.hoverAsync(vehicle)
+        elif operation == "rotate_yaw":
+            future = client.rotateToYawAsync(
+                task["yaw_degrees"], task["margin"], task["timeout"], vehicle
+            )
+        elif operation == "move_to":
+            future = client.moveToPositionAsync(
+                task["x"],
+                task["y"],
+                task["z"],
+                task["speed"],
+                task["timeout"],
+                airsim.DrivetrainType.MaxDegreeOfFreedom,
+                airsim.YawMode(False, task["yaw_degrees"]),
+                -1,
+                1,
+                vehicle,
+            )
+        else:
+            raise ValueError("unknown command operation: %s" % operation)
+        issued.set()
+        # get() waits like join() but also raises an RPC-side error instead of
+        # making a rejected command look successfully completed.
+        future.get()
+        state = client.getMultirotorState(vehicle)
+        position = state.kinematics_estimated.position
+        print(
+            "command complete %s position=%.2f,%.2f,%.2f"
+            % (operation, position.x_val, position.y_val, position.z_val),
+            file=sys.stderr,
+        )
+    except Exception:
+        issued.set()
+        traceback.print_exc(file=sys.stderr)
 
 
 class Bridge(object):
@@ -61,19 +85,36 @@ class Bridge(object):
         self.vehicle_name = "Drone1"
         self.camera_name = "front_center"
         self.armed = {}
-        self.command_queue = multiprocessing.Queue()
-        self.command_process = multiprocessing.Process(
-            target=command_worker, args=(self.command_queue,)
-        )
-        self.command_process.daemon = True
-        self.command_process.start()
+        self.command_process = None
 
     def close(self):
-        self.command_queue.put(None)
-        self.command_process.join(2)
-        if self.command_process.is_alive():
+        if self.command_process and self.command_process.is_alive():
             self.command_process.terminate()
             self.command_process.join(2)
+
+    def _start_command(self, task):
+        """Replace the previous flight future and wait only for RPC acceptance."""
+        if self.command_process and self.command_process.is_alive():
+            # Mission-side arrival tolerance can be reached just before the
+            # AirSim future resolves. Prefer natural completion; cancelling
+            # every short segment can race with and cancel the next RPC too.
+            self.command_process.join(1)
+            if self.command_process.is_alive():
+                print("command supersede %s" % task["operation"], file=sys.stderr)
+                self._ensure_client().cancelLastTask(task["vehicle_name"])
+                time.sleep(0.2)
+                self.command_process.terminate()
+                self.command_process.join(2)
+        issued = multiprocessing.Event()
+        process = multiprocessing.Process(target=execute_command, args=(task, issued))
+        process.daemon = True
+        process.start()
+        if not issued.wait(8):
+            process.terminate()
+            process.join(2)
+            raise RuntimeError("AirSim command process did not issue the RPC")
+        print("command accepted %s" % task["operation"], file=sys.stderr)
+        self.command_process = process
 
     def _ensure_client(self):
         if self.client is None:
@@ -112,28 +153,31 @@ class Bridge(object):
             return {"armed": armed}
         if operation == "takeoff":
             timeout = float(arguments.get("timeout", 20))
-            self.command_queue.put(
+            self._start_command(
                 {"operation": operation, "vehicle_name": vehicle, "timeout": timeout}
             )
             return {"accepted": True}
         if operation == "land":
             timeout = float(arguments.get("timeout", 60))
-            self.command_queue.put(
+            self._start_command(
                 {"operation": operation, "vehicle_name": vehicle, "timeout": timeout}
             )
             return {"accepted": True}
         if operation == "hover":
-            client.cancelLastTask(vehicle)
-            self.command_queue.put({"operation": operation, "vehicle_name": vehicle})
+            self._start_command({"operation": operation, "vehicle_name": vehicle})
             return {"accepted": True}
         if operation == "cancel":
             client.cancelLastTask(vehicle)
+            if self.command_process and self.command_process.is_alive():
+                time.sleep(0.2)
+                self.command_process.terminate()
+                self.command_process.join(2)
             return {"accepted": True}
         if operation == "rotate_yaw":
             yaw = float(arguments["yaw_degrees"])
             margin = float(arguments.get("margin", 5))
             timeout = float(arguments.get("timeout", 10))
-            self.command_queue.put(
+            self._start_command(
                 {
                     "operation": operation,
                     "vehicle_name": vehicle,
@@ -150,7 +194,7 @@ class Bridge(object):
             speed = float(arguments["speed"])
             timeout = float(arguments.get("timeout", 30))
             yaw = float(arguments.get("yaw_degrees", 0))
-            self.command_queue.put(
+            self._start_command(
                 {
                     "operation": operation,
                     "vehicle_name": vehicle,

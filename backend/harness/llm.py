@@ -7,6 +7,7 @@ import struct
 import zlib
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
@@ -68,6 +69,8 @@ class OpenAICompatibleProvider(ModelProvider):
         self.base_url = settings.llm_base_url
         self.model = settings.llm_model
         self._api_key = settings.llm_api_key
+        hostname = (urlparse(self.base_url).hostname or "").lower()
+        self._is_zhipu = hostname == "bigmodel.cn" or hostname.endswith(".bigmodel.cn")
         self._client = httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
         self._probe_result: dict[str, Any] | None = None
 
@@ -96,9 +99,15 @@ class OpenAICompatibleProvider(ModelProvider):
                 }
             ],
             "temperature": 0.1,
-            "max_tokens": 400,
+            "max_tokens": 1024,
             "stream": False,
         }
+        if self._is_zhipu:
+            # GLM-5V-Turbo enables thinking by default. Detection is a short,
+            # deterministic extraction task, so disable thinking and request
+            # the provider's native JSON mode to avoid truncated/empty content.
+            body["thinking"] = {"type": "disabled"}
+            body["response_format"] = {"type": "json_object"}
         response = await self._client.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},

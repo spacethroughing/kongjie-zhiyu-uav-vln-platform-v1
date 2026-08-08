@@ -88,7 +88,53 @@ class LowTakeoffAdapter(MockVehicleAdapter):
         return await super().request(operation, **arguments)
 
 
-async def run_case(tmp_path: Path, provider: ModelProvider, adapter=None):
+class LooseCruiseAccuracyAdapter(MockVehicleAdapter):
+    async def request(self, operation: str, **arguments):
+        if operation == "move_to" and float(arguments.get("speed", 0)) >= 2.9:
+            target = self.position.model_copy(
+                update={
+                    "x": float(arguments["x"]),
+                    "y": float(arguments["y"]),
+                    "z": float(arguments["z"]),
+                }
+            )
+            dx = target.x - self.position.x
+            dy = target.y - self.position.y
+            dz = target.z - self.position.z
+            length = (dx * dx + dy * dy + dz * dz) ** 0.5
+            if length > 1.5:
+                scale = (length - 1.2) / length
+                self.position = self.position.model_copy(
+                    update={
+                        "x": self.position.x + dx * scale,
+                        "y": self.position.y + dy * scale,
+                        "z": self.position.z + dz * scale,
+                    }
+                )
+                self.landed = False
+                return {"accepted": True}
+        return await super().request(operation, **arguments)
+
+
+class GroundContactBeforeLandedAdapter(MockVehicleAdapter):
+    def __init__(self):
+        super().__init__()
+        self.ground_contact = False
+
+    async def request(self, operation: str, **arguments):
+        if operation == "land":
+            self.position = self.position.model_copy(update={"z": 0})
+            self.landed = False
+            self.ground_contact = True
+            return {"accepted": True}
+        payload = await super().request(operation, **arguments)
+        if operation == "state" and self.ground_contact and abs(self.position.z) <= 0.1:
+            payload["landed"] = False
+            payload["collision"] = True
+        return payload
+
+
+async def run_case(tmp_path: Path, provider: ModelProvider, adapter=None, panorama=False):
     settings = Settings(
         host="127.0.0.1",
         port=8000,
@@ -104,6 +150,9 @@ async def run_case(tmp_path: Path, provider: ModelProvider, adapter=None):
     events = EventBus()
     store = Store(settings.data_dir / "test.sqlite3", settings.runs_dir)
     simulator = SimulatorManager(load_scenes(settings.scenes_file), events)
+    if panorama:
+        simulator.profiles["mock"].zones[0].initial_panorama_yaws_deg = [0, 45, 90]
+        simulator.profiles["mock"].zones[0].initial_verify_baseline_m = 4
     missions = MissionService(settings, store, events, simulator, provider)
     await simulator.start("mock")
     if adapter is not None:
@@ -165,3 +214,23 @@ async def test_low_takeoff_climbs_vertically_before_search(tmp_path: Path):
     current, states = await run_case(tmp_path, MockProvider(), LowTakeoffAdapter())
     assert current.state == RunState.SUCCEEDED, current.error
     assert RunState.SEARCHING.value in states
+
+
+@pytest.mark.asyncio
+async def test_short_segments_accept_simpleflight_completion_radius(tmp_path: Path):
+    current, states = await run_case(tmp_path, MockProvider(), LooseCruiseAccuracyAdapter())
+    assert current.state == RunState.SUCCEEDED, current.error
+    assert RunState.SEARCHING.value in states
+
+
+@pytest.mark.asyncio
+async def test_initial_panorama_locks_then_verifies_before_coverage(tmp_path: Path):
+    current, states = await run_case(tmp_path, MockProvider(), panorama=True)
+    assert current.state == RunState.SUCCEEDED, current.error
+    assert RunState.VERIFYING.value in states
+
+
+@pytest.mark.asyncio
+async def test_ground_contact_during_landing_is_not_an_airborne_collision(tmp_path: Path):
+    current, _ = await run_case(tmp_path, MockProvider(), GroundContactBeforeLandedAdapter())
+    assert current.state == RunState.SUCCEEDED, current.error

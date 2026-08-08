@@ -85,6 +85,18 @@ async def list_scenes():
     return [profile.model_dump(mode="json") for profile in services().profiles.values()]
 
 
+@app.get("/api/simulator/diagnostics")
+async def simulator_diagnostics():
+    simulator = services().simulator
+    adapter = simulator.adapter
+    return {
+        "state": simulator.state,
+        "scene_id": simulator.active_profile.id if simulator.active_profile else None,
+        "bridge_pid": adapter.process.pid if getattr(adapter, "process", None) else None,
+        "bridge_stderr_tail": list(getattr(adapter, "stderr_tail", [])),
+    }
+
+
 @app.post("/api/simulator/start")
 async def start_simulator(request: SimulatorStartRequest):
     try:

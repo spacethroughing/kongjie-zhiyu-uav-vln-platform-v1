@@ -218,7 +218,28 @@ class MissionService:
             await self._climb_to_search_altitude(run, plan, zone, home, control)
             run = await self._set_state(run, RunState.SEARCHING)
 
-            for route_point in plan.route:
+            confirmed, observation_index = await self._initial_panorama(
+                run,
+                plan,
+                zone,
+                home,
+                control,
+                candidate_positions,
+                observation_index,
+            )
+            if confirmed:
+                run = await self._set_state(run, RunState.VERIFYING, target_position=confirmed)
+                accepted = await self._approach_and_review(
+                    run, plan, zone, confirmed, home, control
+                )
+                if accepted:
+                    found = True
+                else:
+                    candidate_positions.clear()
+                    run = self.store.get_run(run.id) or run
+                    run = await self._set_state(run, RunState.SEARCHING)
+
+            for route_point in ([] if found else plan.route):
                 directive = await self._handle_control(run, control)
                 if directive == "return_home":
                     break
@@ -233,22 +254,9 @@ class MissionService:
                     )
                     await asyncio.sleep(0.05 if profile.mode == "mock" else 0.7)
                     observation_index += 1
-                    frame = await adapter.capture(profile.vehicle_name)
-                    self._save_frame(run, frame)
-                    await self._event(
-                        "frame.preview",
-                        {
-                            "frame_id": frame.frame_id,
-                            "data_url": f"data:image/png;base64,{frame.scene_png_b64}",
-                            "width": frame.width,
-                            "height": frame.height,
-                        },
-                        run.id,
-                    )
-                    telemetry = await self._telemetry(run)
                     try:
-                        assessment = await self.provider.inspect(
-                            frame, plan.request.target_text, telemetry, observation_index
+                        frame, telemetry, assessment = await self._capture_assessment(
+                            run, plan, observation_index
                         )
                         consecutive_model_failures = 0
                     except Exception as error:
@@ -264,19 +272,6 @@ class MissionService:
                         if consecutive_model_failures >= 3:
                             raise MissionError("three consecutive model calls failed") from error
                         continue
-                    self.store.append_jsonl(
-                        Path(run.artifact_dir) / "model_calls.jsonl",
-                        {
-                            "provider": self.provider.name,
-                            "model": self.settings.llm_model or "mock",
-                            "frame_id": frame.frame_id,
-                            "target_text": plan.request.target_text,
-                            "assessment": assessment.model_dump(mode="json"),
-                        },
-                    )
-                    await self._event(
-                        "vision.assessment", assessment.model_dump(mode="json"), run.id
-                    )
                     confirmed = await self._evaluate_candidate(
                         run, plan, zone, frame, telemetry, assessment, candidate_positions, home
                     )
@@ -307,7 +302,14 @@ class MissionService:
             run = await self._set_state(run, RunState.LANDING)
             await adapter.request("cancel", timeout=3, vehicle_name=profile.vehicle_name)
             await adapter.request("land", timeout=3, vehicle_name=profile.vehicle_name)
-            await self._wait_landed(run, control, timeout=45, ignore_controls=True)
+            await self._wait_landed(
+                run,
+                control,
+                timeout=45,
+                ignore_controls=True,
+                ground_z=control.home_position.z if control.home_position else None,
+            )
+            await adapter.request("arm", vehicle_name=profile.vehicle_name, armed=False, timeout=3)
             run = await self._set_state(run, RunState.ABORTED, error="operator requested landing", ended=True)
         except MissionAborted as error:
             run = self.store.get_run(run.id) or run
@@ -332,6 +334,267 @@ class MissionService:
             current = self.store.get_run(run.id) or run
             self.store.write_report(current, plan)
             self._tasks.pop(run.id, None)
+
+    async def _capture_assessment(
+        self, run: RunRecord, plan: MissionPlan, observation_index: int
+    ) -> tuple[CameraFrame, Telemetry, DetectionAssessment]:
+        profile = self.simulator.active_profile
+        adapter = self.simulator.adapter
+        assert profile and adapter
+        frame = await adapter.capture(profile.vehicle_name)
+        self._save_frame(run, frame)
+        await self._event(
+            "frame.preview",
+            {
+                "frame_id": frame.frame_id,
+                "data_url": f"data:image/png;base64,{frame.scene_png_b64}",
+                "width": frame.width,
+                "height": frame.height,
+            },
+            run.id,
+        )
+        telemetry = await self._telemetry(run)
+        assessment = await self.provider.inspect(
+            frame, plan.request.target_text, telemetry, observation_index
+        )
+        self.store.append_jsonl(
+            Path(run.artifact_dir) / "model_calls.jsonl",
+            {
+                "provider": self.provider.name,
+                "model": self.settings.llm_model or "mock",
+                "frame_id": frame.frame_id,
+                "target_text": plan.request.target_text,
+                "assessment": assessment.model_dump(mode="json"),
+            },
+        )
+        await self._event("vision.assessment", assessment.model_dump(mode="json"), run.id)
+        return frame, telemetry, assessment
+
+    async def _initial_panorama(
+        self,
+        run: RunRecord,
+        plan: MissionPlan,
+        zone: SearchZone,
+        home: Vec3,
+        control: RunControl,
+        candidates: list[tuple[Vec3, Vec3]],
+        observation_index: int,
+    ) -> tuple[Vec3 | None, int]:
+        profile = self.simulator.active_profile
+        adapter = self.simulator.adapter
+        assert profile and adapter
+        if not zone.initial_panorama_yaws_deg:
+            return None, observation_index
+        await self._event(
+            "flight.phase",
+            {
+                "phase": "initial_panorama",
+                "message": "原地环视 360°，VLM 发现有效目标框后立即锁定",
+                "yaws_deg": zone.initial_panorama_yaws_deg,
+            },
+            run.id,
+        )
+        consecutive_failures = 0
+        for yaw in zone.initial_panorama_yaws_deg:
+            directive = await self._handle_control(run, control)
+            if directive == "return_home":
+                return None, observation_index
+            await adapter.request(
+                "rotate_yaw", vehicle_name=profile.vehicle_name, yaw_degrees=yaw, timeout=10
+            )
+            await asyncio.sleep(0.05 if profile.mode == "mock" else 0.7)
+            observation_index += 1
+            try:
+                frame, telemetry, assessment = await self._capture_assessment(
+                    run, plan, observation_index
+                )
+                consecutive_failures = 0
+            except Exception as error:
+                consecutive_failures += 1
+                await self._event(
+                    "model.error",
+                    {
+                        "consecutive_failures": consecutive_failures,
+                        "error": f"{type(error).__name__}: {error}",
+                    },
+                    run.id,
+                )
+                if consecutive_failures >= 3:
+                    raise MissionError("three consecutive model calls failed") from error
+                continue
+            before = len(candidates)
+            await self._evaluate_candidate(
+                run, plan, zone, frame, telemetry, assessment, candidates, home
+            )
+            if len(candidates) == before:
+                continue
+            locked = candidates[-1][0]
+            await self._event(
+                "vision.locked",
+                {
+                    "target": locked.model_dump(),
+                    "frame_id": frame.frame_id,
+                    "bbox_norm": assessment.bbox_norm.model_dump()
+                    if assessment.bbox_norm
+                    else None,
+                    "confidence": assessment.confidence,
+                    "message": "VLM 目标框已锁定，执行短基线安全复核",
+                },
+                run.id,
+            )
+            return await self._verify_locked_candidate(
+                run,
+                plan,
+                zone,
+                home,
+                control,
+                candidates,
+                locked,
+                observation_index,
+            )
+        return None, observation_index
+
+    async def _verify_locked_candidate(
+        self,
+        run: RunRecord,
+        plan: MissionPlan,
+        zone: SearchZone,
+        home: Vec3,
+        control: RunControl,
+        candidates: list[tuple[Vec3, Vec3]],
+        locked: Vec3,
+        observation_index: int,
+    ) -> tuple[Vec3 | None, int]:
+        profile = self.simulator.active_profile
+        adapter = self.simulator.adapter
+        assert profile and adapter
+        telemetry = await self._telemetry(run)
+        center_yaw = math.degrees(
+            math.atan2(
+                locked.y - telemetry.position.y,
+                locked.x - telemetry.position.x,
+            )
+        )
+        await self._event(
+            "flight.phase",
+            {
+                "phase": "locked_centering",
+                "message": "目标已锁定，先转向使候选框居中并刷新深度坐标",
+                "yaw_degrees": center_yaw,
+            },
+            run.id,
+        )
+        await adapter.request(
+            "rotate_yaw",
+            vehicle_name=profile.vehicle_name,
+            yaw_degrees=center_yaw,
+            timeout=10,
+        )
+        await asyncio.sleep(0.05 if profile.mode == "mock" else 0.7)
+        observation_index += 1
+        try:
+            frame, telemetry, assessment = await self._capture_assessment(
+                run, plan, observation_index
+            )
+            before = len(candidates)
+            centered = await self._evaluate_candidate(
+                run, plan, zone, frame, telemetry, assessment, candidates, home
+            )
+            if centered:
+                locked = centered
+            elif len(candidates) > before:
+                locked = candidates[-1][0]
+            await self._event(
+                "vision.lock_refined",
+                {
+                    "target": locked.model_dump(),
+                    "frame_id": frame.frame_id,
+                    "bbox_norm": assessment.bbox_norm.model_dump()
+                    if assessment.bbox_norm
+                    else None,
+                    "message": "目标已居中，使用刷新后的深度坐标执行短基线复核",
+                },
+                run.id,
+            )
+        except Exception as error:
+            await self._event(
+                "model.error",
+                {"consecutive_failures": 1, "error": f"{type(error).__name__}: {error}"},
+                run.id,
+            )
+            telemetry = await self._telemetry(run)
+        dx = locked.x - telemetry.position.x
+        dy = locked.y - telemetry.position.y
+        horizontal = math.hypot(dx, dy)
+        if horizontal < 1e-6:
+            return None, observation_index
+        baseline = zone.initial_verify_baseline_m
+        offsets = [(-dy / horizontal * baseline, dx / horizontal * baseline)]
+        offsets.append((-offsets[0][0], -offsets[0][1]))
+        verify_point = None
+        for offset_x, offset_y in offsets:
+            candidate = Vec3(
+                x=telemetry.position.x + offset_x,
+                y=telemetry.position.y + offset_y,
+                z=telemetry.position.z,
+            )
+            try:
+                validate_position(self._to_home(candidate, home), zone, plan.safety)
+            except SafetyViolation:
+                continue
+            verify_point = candidate
+            break
+        if verify_point is None:
+            await self._event(
+                "vision.rejected", {"reason": "no safe baseline verification point"}, run.id
+            )
+            return None, observation_index
+        await self._event(
+            "flight.phase",
+            {
+                "phase": "locked_baseline",
+                "message": f"目标已锁定，横移 {baseline:.1f} m 获取第二视角",
+            },
+            run.id,
+        )
+        await self._move_segmented(
+            run,
+            plan,
+            zone,
+            verify_point,
+            home,
+            control,
+            speed=min(2.0, plan.safety.max_speed_mps),
+        )
+        yaw = math.degrees(
+            math.atan2(locked.y - verify_point.y, locked.x - verify_point.x)
+        )
+        await adapter.request(
+            "rotate_yaw", vehicle_name=profile.vehicle_name, yaw_degrees=yaw, timeout=10
+        )
+        await asyncio.sleep(0.05 if profile.mode == "mock" else 0.7)
+        observation_index += 1
+        try:
+            frame, telemetry, assessment = await self._capture_assessment(
+                run, plan, observation_index
+            )
+        except Exception as error:
+            await self._event(
+                "model.error",
+                {"consecutive_failures": 1, "error": f"{type(error).__name__}: {error}"},
+                run.id,
+            )
+            return None, observation_index
+        confirmed = await self._evaluate_candidate(
+            run, plan, zone, frame, telemetry, assessment, candidates, home
+        )
+        if not confirmed:
+            await self._event(
+                "vision.rejected",
+                {"reason": "locked target did not pass the second-view consistency check"},
+                run.id,
+            )
+        return confirmed, observation_index
 
     async def _evaluate_candidate(
         self,
@@ -435,7 +698,10 @@ class MissionService:
         )
         run = await self._set_state(run, RunState.LANDING)
         await adapter.request("land", vehicle_name=vehicle_name, timeout=60)
-        await self._wait_landed(run, RunControl(), timeout=60, ignore_controls=True)
+        await self._wait_landed(
+            run, RunControl(), timeout=60, ignore_controls=True, ground_z=home.z
+        )
+        await adapter.request("arm", vehicle_name=vehicle_name, armed=False, timeout=5)
         return run
 
     async def _move_segmented(
@@ -454,7 +720,11 @@ class MissionService:
         telemetry = await self._telemetry(run)
         start = telemetry.position
         total = distance(start, target)
-        segments = max(1, math.ceil(total / 2.0))
+        # Segments must remain longer than SimpleFlight's automatic lookahead;
+        # ~2 m commands at 3 m/s may resolve immediately without moving.
+        # Four metres is still a short, bounded command while clearing that
+        # dead zone reliably in UE4.27/AirSim 1.8.1.
+        segments = max(1, math.ceil(total / 4.0))
         for index in range(1, segments + 1):
             await self._handle_control(run, control)
             ratio = index / segments
@@ -473,7 +743,11 @@ class MissionService:
                 speed=min(speed or plan.safety.max_speed_mps, plan.safety.max_speed_mps),
                 timeout=20,
             )
-            await self._wait_position(run, point, control, timeout=20)
+            # SimpleFlight can resolve a short moveToPosition future about
+            # 1.2 m from its requested point at cruise speed. Intermediate
+            # segments use a matching acceptance radius; every telemetry
+            # sample is still checked against the full safety envelope.
+            await self._wait_position(run, point, control, timeout=20, tolerance=1.5)
 
     async def _climb_to_search_altitude(
         self,
@@ -538,13 +812,18 @@ class MissionService:
         raise MissionError("vehicle did not reach the search altitude before timeout")
 
     async def _wait_position(
-        self, run: RunRecord, target: Vec3, control: RunControl, timeout: float
+        self,
+        run: RunRecord,
+        target: Vec3,
+        control: RunControl,
+        timeout: float,
+        tolerance: float = 0.75,
     ) -> Telemetry:
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             await self._handle_control(run, control)
             telemetry = await self._telemetry(run)
-            if distance(telemetry.position, target) <= 0.75:
+            if distance(telemetry.position, target) <= tolerance:
                 return telemetry
             await asyncio.sleep(0.2)
         raise MissionError("vehicle did not reach the requested position before timeout")
@@ -580,13 +859,47 @@ class MissionService:
         control: RunControl,
         timeout: float,
         ignore_controls: bool = False,
+        ground_z: float | None = None,
     ) -> Telemetry:
+        profile = self.simulator.active_profile
+        adapter = self.simulator.adapter
+        if not profile or not adapter:
+            raise MissionError("simulator disconnected")
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             if not ignore_controls:
                 await self._handle_control(run, control)
-            telemetry = await self._telemetry(run)
-            if telemetry.landed:
+            telemetry = await adapter.telemetry(profile.vehicle_name)
+            values = (
+                telemetry.position.x,
+                telemetry.position.y,
+                telemetry.position.z,
+                telemetry.velocity.x,
+                telemetry.velocity.y,
+                telemetry.velocity.z,
+            )
+            if not all(math.isfinite(value) for value in values):
+                raise SafetyViolation("telemetry contains a non-finite value")
+            age = (utc_now() - telemetry.timestamp).total_seconds()
+            if age > profile.safety.telemetry_stale_seconds:
+                raise SafetyViolation(f"telemetry is stale by {age:.2f} seconds")
+            self.store.append_jsonl(
+                Path(run.artifact_dir) / "telemetry.jsonl", telemetry.model_dump(mode="json")
+            )
+            await self._event("telemetry", telemetry.model_dump(mode="json"), run.id)
+            speed = math.sqrt(
+                telemetry.velocity.x**2
+                + telemetry.velocity.y**2
+                + telemetry.velocity.z**2
+            )
+            near_ground = (
+                ground_z is not None
+                and abs(telemetry.position.z - ground_z) <= 0.3
+                and speed <= 0.5
+            )
+            if telemetry.collision and not near_ground:
+                raise SafetyViolation("AirSim reported a collision")
+            if telemetry.landed or near_ground:
                 return telemetry
             await asyncio.sleep(0.2)
         raise MissionError("landing did not complete before timeout")
