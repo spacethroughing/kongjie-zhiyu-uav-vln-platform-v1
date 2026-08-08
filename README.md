@@ -6,6 +6,7 @@
 
 - Blocks / CityPark 场景白名单与一键托管
 - 任务计划预览和人工批准后执行
+- Web 端 NED 地图拖拽/数值编辑任务级安全范围，并由场景硬上限约束
 - 单机 `SimpleFlight` 覆盖搜索、目标居中深度定位、朝向锁定接近、取证和返航
 - OpenAI-compatible 多模态适配器和无需密钥的 Mock Provider
 - Python 3.7 AirSim JSONL 隔离桥，现代控制面使用 Python 3.11
@@ -61,6 +62,7 @@ LLM_API_KEY=replace-me
 - UE 启动路径只能来自 `configs/scenes.json`。
 - 模型输出不能产生任意坐标或执行程序，只能提交标准化视觉判断。
 - 飞行命令会经过地理围栏、限高、限速、禁飞区和任务状态校验。
+- 手动安全范围必须包含返航原点，不能超出场景 `manual_safety_bounds`，并会固化到计划、清单和报告。
 - `hard-stop` 仅用于仿真，会停止 UE 进程并把运行标记为失败。
 - 低置信度、无深度、跨视角位置不一致不会触发接近；连续三次模型失败进入 `SAFE_HOLD`。
 - `configs/environment-baseline.json` 保存安装基线；每次任务的 `manifest.json` 重新计算实际文件指纹。

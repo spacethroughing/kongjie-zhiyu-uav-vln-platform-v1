@@ -10,7 +10,7 @@ from harness.events import EventBus
 from harness.bridge import MockVehicleAdapter
 from harness.llm import MockProvider, ModelProvider
 from harness.mission import MissionService
-from harness.models import RunState, SearchMissionRequest, TERMINAL_STATES
+from harness.models import BoundingBox, DetectionAssessment, RunState, SearchMissionRequest, TERMINAL_STATES
 from harness.simulator import SimulatorManager
 from harness.store import Store
 
@@ -62,6 +62,24 @@ class FailingProvider(ModelProvider):
 
     async def inspect(self, frame, target_text, telemetry, observation_index):
         raise ValueError("malformed model output")
+
+
+class InconsistentCenteredProvider(ModelProvider):
+    name = "inconsistent-centered"
+
+    async def inspect(self, frame, target_text, telemetry, observation_index):
+        boxes = {
+            2: BoundingBox(x_min=0.4, y_min=0.4, x_max=0.6, y_max=0.6),
+            3: BoundingBox(x_min=0.8, y_min=0.4, x_max=0.98, y_max=0.6),
+        }
+        box = boxes.get(observation_index)
+        return DetectionAssessment(
+            frame_id=frame.frame_id,
+            is_match=box is not None,
+            confidence=0.95 if box else 0.1,
+            bbox_norm=box,
+            evidence="synthetic inconsistent centered lock",
+        )
 
 
 class NoDepthAdapter(MockVehicleAdapter):
@@ -269,6 +287,15 @@ async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_pa
         and event["payload"].get("phase") == "locked_baseline"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_inconsistent_centered_depth_never_approaches(tmp_path: Path):
+    current, states = await run_case(tmp_path, InconsistentCenteredProvider(), panorama=True)
+    assert current.state == RunState.NOT_FOUND, current.error
+    assert RunState.APPROACHING.value not in states
+    events = (Path(current.artifact_dir) / "events.jsonl").read_text(encoding="utf-8")
+    assert "centered depth position is inconsistent" in events
 
 
 @pytest.mark.asyncio

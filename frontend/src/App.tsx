@@ -1,9 +1,35 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { MapView } from "./MapView";
-import type { HarnessEvent, MissionPlan, Run, Scene, Telemetry } from "./types";
+import type { HarnessEvent, MissionPlan, Run, SafetyBounds, Scene, Telemetry, Zone } from "./types";
 
 const terminal = new Set(["SUCCEEDED", "FAILED", "ABORTED", "NOT_FOUND"]);
+
+function boundsFromZone(zone: Zone | undefined): SafetyBounds | undefined {
+  if (!zone) return undefined;
+  const xs = zone.polygon.points.map(([x]) => x);
+  const ys = zone.polygon.points.map(([, y]) => y);
+  return {
+    x_min: Math.min(...xs),
+    x_max: Math.max(...xs),
+    y_min: Math.min(...ys),
+    y_max: Math.max(...ys),
+  };
+}
+
+function safetyBoundsIssue(bounds: SafetyBounds | undefined, limit: SafetyBounds | undefined): string | undefined {
+  if (!bounds || !Object.values(bounds).every(Number.isFinite)) return "请完整填写四个有限数值";
+  if (bounds.x_min >= bounds.x_max || bounds.y_min >= bounds.y_max) return "最小值必须小于最大值";
+  if (bounds.x_max - bounds.x_min < 4 || bounds.y_max - bounds.y_min < 4) return "X、Y 方向跨度均不能小于 4 m";
+  if (!(bounds.x_min <= 0 && bounds.x_max >= 0 && bounds.y_min <= 0 && bounds.y_max >= 0)) {
+    return "任务安全范围必须包含返航起点 (0, 0)";
+  }
+  if (limit && (
+    bounds.x_min < limit.x_min || bounds.x_max > limit.x_max ||
+    bounds.y_min < limit.y_min || bounds.y_max > limit.y_max
+  )) return "任务范围不能超出场景硬限制";
+  return undefined;
+}
 
 function eventSummary(event: HarnessEvent): string {
   const payload = event.payload;
@@ -45,12 +71,25 @@ export default function App() {
   const [events, setEvents] = useState<HarnessEvent[]>([]);
   const [preview, setPreview] = useState<string>();
   const [candidateBox, setCandidateBox] = useState<{x_min:number;y_min:number;x_max:number;y_max:number}>();
+  const [manualSafetyEnabled, setManualSafetyEnabled] = useState(false);
+  const [manualSafetyBounds, setManualSafetyBounds] = useState<SafetyBounds>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const reconnect = useRef<number>();
+  const missionConfigRevision = useRef(0);
 
   const scene = useMemo(() => scenes.find((item) => item.id === sceneId), [scenes, sceneId]);
   const zone = scene?.zones.find((item) => item.id === zoneId) ?? scene?.zones[0];
+  const zonePresetBounds = useMemo(() => boundsFromZone(zone), [zone]);
+  const hardSafetyBounds = scene?.manual_safety_bounds ?? zonePresetBounds;
+  const manualSafetyError = manualSafetyEnabled
+    ? safetyBoundsIssue(manualSafetyBounds, hardSafetyBounds)
+    : undefined;
+
+  function invalidatePlan() {
+    missionConfigRevision.current += 1;
+    setPlan(undefined);
+  }
 
   useEffect(() => {
     Promise.all([api.scenes(), api.health(), api.runs()])
@@ -67,6 +106,12 @@ export default function App() {
   useEffect(() => {
     if (scene?.zones[0] && !scene.zones.some((item) => item.id === zoneId)) setZoneId(scene.zones[0].id);
   }, [scene, zoneId]);
+
+  useEffect(() => {
+    if (!zonePresetBounds) return;
+    setManualSafetyBounds(zonePresetBounds);
+    invalidatePlan();
+  }, [scene?.id, zone?.id]);
 
   useEffect(() => {
     let socket: WebSocket;
@@ -104,6 +149,31 @@ export default function App() {
     finally { setBusy(false); }
   }
 
+  function updateSafetyBound(key: keyof SafetyBounds, value: number) {
+    if (Number.isFinite(value) && hardSafetyBounds) {
+      const axis = key.startsWith("x") ? "x" : "y";
+      value = Math.min(hardSafetyBounds[`${axis}_max`], Math.max(hardSafetyBounds[`${axis}_min`], value));
+    }
+    setManualSafetyBounds((current) => ({ ...(current ?? zonePresetBounds!), [key]: value }));
+    invalidatePlan();
+  }
+
+  function replaceSafetyBounds(bounds: SafetyBounds) {
+    setManualSafetyBounds(bounds);
+    invalidatePlan();
+  }
+
+  async function createPlan() {
+    const revision = missionConfigRevision.current;
+    const created = await api.plan(
+      sceneId,
+      zone?.id ?? "",
+      targetText,
+      manualSafetyEnabled ? manualSafetyBounds : undefined,
+    );
+    if (revision === missionConfigRevision.current) setPlan(created);
+  }
+
   const latest = telemetryPath.at(-1);
   const active = run && !terminal.has(run.state);
   const currentState = active ? run.state : simState === "READY" ? "READY" : "IDLE";
@@ -122,12 +192,62 @@ export default function App() {
         <aside className="left-stack">
           <article className="panel mission-panel">
             <div className="panel-title"><span>01</span><h2>任务配置</h2></div>
-            <label>仿真场景<select value={sceneId} disabled={simState !== "STOPPED"} onChange={(e) => setSceneId(e.target.value)}>{scenes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
-            <label>搜索区域<select value={zone?.id ?? ""} onChange={(e) => setZoneId(e.target.value)}>{scene?.zones.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
-            <label>开放词汇目标<textarea rows={3} value={targetText} onChange={(e) => setTargetText(e.target.value)} /></label>
+            <label>仿真场景<select value={sceneId} disabled={simState !== "STOPPED"} onChange={(e) => { setSceneId(e.target.value); invalidatePlan(); }}>{scenes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
+            <label>搜索区域<select value={zone?.id ?? ""} onChange={(e) => { setZoneId(e.target.value); invalidatePlan(); }}>{scene?.zones.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>
+            <section className={`safety-editor ${manualSafetyEnabled ? "enabled" : ""}`} aria-label="任务安全范围">
+              <div className="safety-editor-head">
+                <label className="safety-toggle">
+                  <span>手动安全范围</span>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={manualSafetyEnabled}
+                    onChange={(event) => {
+                      const enabled = event.target.checked;
+                      setManualSafetyEnabled(enabled);
+                      if (enabled && zonePresetBounds) setManualSafetyBounds(zonePresetBounds);
+                      invalidatePlan();
+                    }}
+                  />
+                  <i aria-hidden="true" />
+                </label>
+                <button
+                  type="button"
+                  className="restore-bounds"
+                  disabled={!manualSafetyEnabled || !zonePresetBounds}
+                  onClick={() => zonePresetBounds && replaceSafetyBounds(zonePresetBounds)}
+                >恢复区域预设</button>
+              </div>
+              {hardSafetyBounds && <p className="safety-limit">
+                允许范围：X {hardSafetyBounds.x_min.toFixed(1)} ～ {hardSafetyBounds.x_max.toFixed(1)} m · Y {hardSafetyBounds.y_min.toFixed(1)} ～ {hardSafetyBounds.y_max.toFixed(1)} m
+              </p>}
+              {manualSafetyEnabled && manualSafetyBounds && <>
+                <div className="bounds-grid">
+                  {(["x_min", "x_max", "y_min", "y_max"] as const).map((key) => {
+                    const axis = key.startsWith("x") ? "x" : "y";
+                    const edge = key.endsWith("min") ? "最小" : "最大";
+                    return <label key={key}>{axis.toUpperCase()} {edge}
+                      <input
+                        type="number"
+                        step="0.5"
+                        min={hardSafetyBounds?.[`${axis}_min`]}
+                        max={hardSafetyBounds?.[`${axis}_max`]}
+                        value={Number.isFinite(manualSafetyBounds[key]) ? manualSafetyBounds[key] : ""}
+                        aria-label={`${axis.toUpperCase()} ${edge}值`}
+                        onChange={(event) => updateSafetyBound(key, event.currentTarget.valueAsNumber)}
+                      />
+                    </label>;
+                  })}
+                </div>
+                <p className={`bounds-validation ${manualSafetyError ? "invalid" : "valid"}`}>
+                  {manualSafetyError ?? "范围有效，将仅对此任务生效"}
+                </p>
+              </>}
+            </section>
+            <label>开放词汇目标<textarea rows={3} value={targetText} onChange={(e) => { setTargetText(e.target.value); invalidatePlan(); }} /></label>
             <div className="button-row">
               {simState === "STOPPED" ? <button className="primary" disabled={busy} onClick={() => act(() => api.start(sceneId))}>启动场景</button> : <button disabled={busy || Boolean(active)} onClick={() => act(() => api.stop())}>停止场景</button>}
-              <button disabled={busy || simState !== "READY" || !targetText.trim()} onClick={() => act(async () => setPlan(await api.plan(sceneId, zone?.id ?? "", targetText)))}>生成计划</button>
+              <button disabled={busy || simState !== "READY" || !targetText.trim() || !zone || Boolean(manualSafetyError)} onClick={() => act(createPlan)}>生成计划</button>
             </div>
           </article>
 
@@ -155,7 +275,14 @@ export default function App() {
 
           <article className="panel map-panel">
             <div className="panel-title"><span>NED</span><h2>搜索区与飞行轨迹</h2><em>{zone?.name}</em></div>
-            <MapView zone={zone} telemetryPath={telemetryPath} target={run?.target_position} />
+            <MapView
+              zone={zone}
+              hardBounds={hardSafetyBounds}
+              safetyBounds={manualSafetyEnabled ? manualSafetyBounds : undefined}
+              telemetryPath={telemetryPath}
+              target={run?.target_position}
+              onSafetyBoundsChange={manualSafetyEnabled ? replaceSafetyBounds : undefined}
+            />
           </article>
         </section>
 

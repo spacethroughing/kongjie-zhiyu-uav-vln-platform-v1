@@ -27,7 +27,7 @@ from .models import (
     Vec3,
     utc_now,
 )
-from .planner import build_plan
+from .planner import build_plan, resolve_search_zone
 from .safety import SafetyViolation, approach_point, point_in_polygon, validate_position, validate_telemetry
 from .simulator import SimulatorManager
 from .store import Store
@@ -177,7 +177,7 @@ class MissionService:
 
     def _zone(self, plan: MissionPlan) -> SearchZone:
         profile = self.simulator.profiles[plan.request.scene_id]
-        return next(zone for zone in profile.zones if zone.id == plan.request.zone_id)
+        return resolve_search_zone(profile, plan.request)
 
     async def _execute(self, run: RunRecord, plan: MissionPlan) -> None:
         adapter = self.simulator.adapter
@@ -503,12 +503,28 @@ class MissionService:
             if centered:
                 locked = centered
             elif len(candidates) > before:
-                locked = candidates[-1][0]
+                refined = candidates[-1][0]
+                position_delta = distance(locked, refined)
+                if position_delta > 3.0:
+                    await self._event(
+                        "vision.rejected",
+                        {
+                            "reason": "centered depth position is inconsistent with the initial lock",
+                            "initial_target": self._to_home(locked, home).model_dump(),
+                            "refined_target": self._to_home(refined, home).model_dump(),
+                            "position_delta_m": position_delta,
+                            "message": f"居中复核位置偏差 {position_delta:.1f} m，拒绝接近",
+                        },
+                        run.id,
+                    )
+                    return None, observation_index
+                locked = refined
                 await self._event(
                     "vision.confirmed",
                     {
                         "target": locked.model_dump(),
                         "mode": "centered_single_view",
+                        "position_delta_m": position_delta,
                     },
                     run.id,
                 )
@@ -563,8 +579,21 @@ class MissionService:
         except DepthLocalizationError as error:
             await self._event("vision.rejected", {"reason": str(error)}, run.id)
             return None
-        if not point_in_polygon(self._to_home(target, home), zone.polygon):
-            await self._event("vision.rejected", {"reason": "target is outside the search zone"}, run.id)
+        relative_target = self._to_home(target, home)
+        if not point_in_polygon(relative_target, zone.polygon):
+            await self._event(
+                "vision.rejected",
+                {
+                    "reason": "target is outside the search zone",
+                    "target_ned": relative_target.model_dump(),
+                    "message": (
+                        "候选目标位于安全范围外："
+                        f"NED ({relative_target.x:.1f}, {relative_target.y:.1f}, "
+                        f"{relative_target.z:.1f}) m"
+                    ),
+                },
+                run.id,
+            )
             return None
         for previous_target, previous_camera in candidates:
             if distance(previous_camera, frame.camera_position) >= 0.5 and distance(previous_target, target) <= 3.0:

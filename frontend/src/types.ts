@@ -1,5 +1,12 @@
 export type Vec3 = { x: number; y: number; z: number };
 
+export type SafetyBounds = {
+  x_min: number;
+  x_max: number;
+  y_min: number;
+  y_max: number;
+};
+
 export type Zone = {
   id: string;
   name: string;
@@ -12,6 +19,7 @@ export type Scene = {
   id: string;
   name: string;
   mode: "mock" | "editor" | "packaged";
+  manual_safety_bounds?: SafetyBounds;
   zones: Zone[];
   safety: {
     max_speed_mps: number;
@@ -24,7 +32,12 @@ export type Scene = {
 export type MissionPlan = {
   id: string;
   version: number;
-  request: { scene_id: string; zone_id: string; target_text: string };
+  request: {
+    scene_id: string;
+    zone_id: string;
+    target_text: string;
+    safety_bounds?: SafetyBounds;
+  };
   route: { index: number; position: Vec3; observe: boolean }[];
   observation_yaws_deg: number[];
   safety_summary: string[];
@@ -73,4 +86,3 @@ export type HarnessEvent = {
   timestamp?: string;
   payload: Record<string, unknown>;
 };
-

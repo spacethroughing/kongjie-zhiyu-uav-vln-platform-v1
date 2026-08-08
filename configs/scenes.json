@@ -5,6 +5,7 @@
       "name": "Mock E2E（无需 UE）",
       "mode": "mock",
       "vehicle_name": "Drone1",
+      "manual_safety_bounds": {"x_min": -30, "x_max": 30, "y_min": -30, "y_max": 30},
       "zones": [
         {
           "id": "mock-fixture",
@@ -36,6 +37,7 @@
       "settings": "C:\\Users\\Mingyi Liu\\Documents\\Codex\\2026-08-08\\new-chat-2\\outputs\\airsim-llm-harness\\configs\\airsim\\blocks.settings.json",
       "vehicle_name": "Drone1",
       "bridge_conda_env": "airsim",
+      "manual_safety_bounds": {"x_min": -45, "x_max": 45, "y_min": -45, "y_max": 45},
       "launch_args": ["-windowed", "-ResX=1280", "-ResY=720", "-NoSound", "-HarnessFixture"],
       "checksum_paths": ["E:\\C\\AirSim\\Unreal\\Environments\\Blocks\\Content\\FlyingCPP\\Maps\\FlyingExampleMap.umap"],
       "zones": [
@@ -72,6 +74,7 @@
       "settings": "C:\\Users\\Mingyi Liu\\Documents\\Codex\\2026-08-08\\new-chat-2\\outputs\\airsim-llm-harness\\configs\\airsim\\citypark.settings.json",
       "vehicle_name": "Drone1",
       "bridge_conda_env": "airsim",
+      "manual_safety_bounds": {"x_min": -30, "x_max": 30, "y_min": -30, "y_max": 30},
       "launch_args": ["-windowed", "-ResX=1280", "-ResY=720", "-NoSound"],
       "checksum_paths": ["D:\\CityParkEnvironmentCollec\\Content\\CityPark\\Maps\\Showcase.umap"],
       "zones": [

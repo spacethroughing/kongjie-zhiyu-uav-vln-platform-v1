@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from harness.models import BoundingBox, DetectionAssessment, Polygon, SearchMissionRequest
+from harness.models import BoundingBox, DetectionAssessment, Polygon, SafetyBounds, SearchMissionRequest
 
 
 def test_matching_detection_requires_bbox():
@@ -23,3 +23,9 @@ def test_polygon_requires_area():
     with pytest.raises(ValidationError):
         Polygon(points=[(0, 0), (1, 1), (2, 2)])
 
+
+def test_manual_safety_bounds_require_a_finite_minimum_rectangle():
+    with pytest.raises(ValidationError):
+        SafetyBounds(x_min=0, x_max=3, y_min=-10, y_max=10)
+    with pytest.raises(ValidationError):
+        SafetyBounds(x_min=float("nan"), x_max=10, y_min=-10, y_max=10)

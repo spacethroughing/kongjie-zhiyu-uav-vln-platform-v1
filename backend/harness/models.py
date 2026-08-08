@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
@@ -65,6 +66,36 @@ class Polygon(BaseModel):
         return self
 
 
+class SafetyBounds(BaseModel):
+    """Axis-aligned, home-relative NED bounds selected for one mission."""
+
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+
+    @model_validator(mode="after")
+    def valid_rectangle(self) -> "SafetyBounds":
+        values = (self.x_min, self.x_max, self.y_min, self.y_max)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("safety bounds must be finite")
+        if self.x_min >= self.x_max or self.y_min >= self.y_max:
+            raise ValueError("safety bounds minimums must be smaller than maximums")
+        if self.x_max - self.x_min < 4 or self.y_max - self.y_min < 4:
+            raise ValueError("safety bounds must span at least 4 m on each axis")
+        return self
+
+    def polygon(self) -> Polygon:
+        return Polygon(
+            points=[
+                (self.x_min, self.y_min),
+                (self.x_max, self.y_min),
+                (self.x_max, self.y_max),
+                (self.x_min, self.y_max),
+            ]
+        )
+
+
 class SafetyEnvelope(BaseModel):
     min_altitude_m: float = 2.0
     max_altitude_m: float = 30.0
@@ -107,6 +138,7 @@ class SceneProfile(BaseModel):
     bridge_conda_env: str = "airsim"
     launch_args: list[str] = Field(default_factory=list)
     checksum_paths: list[str] = Field(default_factory=list)
+    manual_safety_bounds: SafetyBounds | None = None
     zones: list[SearchZone]
     safety: SafetyEnvelope = Field(default_factory=SafetyEnvelope)
 
@@ -116,6 +148,21 @@ class SceneProfile(BaseModel):
             raise ValueError("non-mock scene requires executable")
         if self.mode == "editor" and not self.project:
             raise ValueError("editor scene requires project")
+        if self.manual_safety_bounds:
+            bounds = self.manual_safety_bounds
+            if not (bounds.x_min <= 0 <= bounds.x_max and bounds.y_min <= 0 <= bounds.y_max):
+                raise ValueError("scene manual safety limit must include NED home (0, 0)")
+            for zone in self.zones:
+                if any(
+                    x < bounds.x_min
+                    or x > bounds.x_max
+                    or y < bounds.y_min
+                    or y > bounds.y_max
+                    for x, y in zone.polygon.points
+                ):
+                    raise ValueError(
+                        f"zone {zone.id!r} extends beyond the scene manual safety limit"
+                    )
         return self
 
 
@@ -124,6 +171,7 @@ class SearchMissionRequest(BaseModel):
     zone_id: str
     target_text: str = Field(min_length=2, max_length=500)
     end_policy: Literal["review_then_rth", "auto_rth"] = "review_then_rth"
+    safety_bounds: SafetyBounds | None = None
 
     @field_validator("target_text")
     @classmethod

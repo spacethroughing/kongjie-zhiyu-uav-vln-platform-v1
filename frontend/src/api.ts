@@ -1,4 +1,4 @@
-import type { MissionPlan, Run, Scene } from "./types";
+import type { MissionPlan, Run, SafetyBounds, Scene } from "./types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -19,10 +19,16 @@ export const api = {
   start: (scene_id: string) =>
     request<{ state: string }>("/api/simulator/start", { method: "POST", body: JSON.stringify({ scene_id }) }),
   stop: () => request("/api/simulator/stop", { method: "POST" }),
-  plan: (scene_id: string, zone_id: string, target_text: string) =>
+  plan: (scene_id: string, zone_id: string, target_text: string, safety_bounds?: SafetyBounds) =>
     request<MissionPlan>("/api/missions/plan", {
       method: "POST",
-      body: JSON.stringify({ scene_id, zone_id, target_text, end_policy: "review_then_rth" }),
+      body: JSON.stringify({
+        scene_id,
+        zone_id,
+        target_text,
+        end_policy: "review_then_rth",
+        ...(safety_bounds ? { safety_bounds } : {}),
+      }),
     }),
   approve: (planId: string) => request<Run>(`/api/missions/${planId}/approve`, { method: "POST" }),
   control: (runId: string, action: string) =>
@@ -30,4 +36,3 @@ export const api = {
   candidate: (runId: string, decision: "accept" | "continue") =>
     request(`/api/runs/${runId}/candidate`, { method: "POST", body: JSON.stringify({ decision }) }),
 };
-

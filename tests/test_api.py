@@ -28,7 +28,13 @@ def test_health_and_plan_require_ready_simulator(monkeypatch, tmp_path):
         assert smoke.json()["telemetry"]["landed"] is True
         plan = client.post(
             "/api/missions/plan",
-            json={"scene_id": "mock", "zone_id": "mock-fixture", "target_text": "red cube"},
+            json={
+                "scene_id": "mock",
+                "zone_id": "mock-fixture",
+                "target_text": "red cube",
+                "safety_bounds": {"x_min": -20, "x_max": 20, "y_min": -20, "y_max": 20},
+            },
         )
         assert plan.status_code == 200
+        assert plan.json()["request"]["safety_bounds"]["x_min"] == -20
         assert client.post(f"/api/missions/{plan.json()['id']}/approve").status_code == 200
