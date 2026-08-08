@@ -120,8 +120,9 @@ class SimulatorManager:
             phase = "initialization"
             await self.events.publish("simulator.smoke", {"phase": "starting", "scene_id": profile.id})
             try:
-                initial = await self.adapter.telemetry(vehicle_name)
+                initial = await self._wait_ground_stable(vehicle_name)
                 ground_z = initial.position.z
+                await self.events.publish("telemetry", initial.model_dump(mode="json"))
                 phase = "API control"
                 await self.adapter.request("api_control", timeout=5, enabled=True, vehicle_name=vehicle_name)
                 phase = "arming"
@@ -151,6 +152,15 @@ class SimulatorManager:
                 await self.adapter.request("hover", timeout=5, vehicle_name=vehicle_name)
                 phase = "image capture"
                 frame = await self.adapter.capture(vehicle_name)
+                await self.events.publish(
+                    "frame.preview",
+                    {
+                        "frame_id": frame.frame_id,
+                        "data_url": f"data:image/png;base64,{frame.scene_png_b64}",
+                        "width": frame.width,
+                        "height": frame.height,
+                    },
+                )
                 phase = "landing"
                 await self.adapter.request("land", timeout=5, vehicle_name=vehicle_name)
                 landed = await self._wait_vehicle(
@@ -166,6 +176,7 @@ class SimulatorManager:
                 await self.adapter.request("arm", timeout=5, armed=False, vehicle_name=vehicle_name)
                 await asyncio.sleep(0.5)
                 final = await self.adapter.telemetry(vehicle_name)
+                await self.events.publish("telemetry", final.model_dump(mode="json"))
                 result = {
                     "ok": True,
                     "scene_id": profile.id,
@@ -204,10 +215,29 @@ class SimulatorManager:
         last = None
         while asyncio.get_running_loop().time() < deadline:
             last = await self.adapter.telemetry(vehicle_name)
+            await self.events.publish("telemetry", last.model_dump(mode="json"))
             if predicate(last):
                 return last
             await asyncio.sleep(0.5)
         raise SimulatorError(f"timed out waiting for {phase}; last telemetry: {last}")
+
+    async def _wait_ground_stable(self, vehicle_name: str, timeout: float = 6):
+        """Let a newly spawned AirSim pawn settle before recording its home z."""
+        assert self.adapter
+        deadline = asyncio.get_running_loop().time() + timeout
+        samples = []
+        last = await self.adapter.telemetry(vehicle_name)
+        while asyncio.get_running_loop().time() < deadline:
+            last = await self.adapter.telemetry(vehicle_name)
+            if last.landed and abs(last.velocity.z) <= 0.05:
+                samples.append(last.position.z)
+                samples = samples[-3:]
+                if len(samples) == 3 and max(samples) - min(samples) <= 0.03:
+                    return last
+            else:
+                samples.clear()
+            await asyncio.sleep(0.25)
+        return last
 
     async def _stop_unlocked(self, hard: bool) -> None:
         profile = self.active_profile
