@@ -215,6 +215,7 @@ class MissionService:
                     await adapter.request(
                         "arm", vehicle_name=profile.vehicle_name, armed=True, timeout=3
                     )
+            await self._climb_to_search_altitude(run, plan, zone, home, control)
             run = await self._set_state(run, RunState.SEARCHING)
 
             for route_point in plan.route:
@@ -473,6 +474,68 @@ class MissionService:
                 timeout=20,
             )
             await self._wait_position(run, point, control, timeout=20)
+
+    async def _climb_to_search_altitude(
+        self,
+        run: RunRecord,
+        plan: MissionPlan,
+        zone: SearchZone,
+        home: Vec3,
+        control: RunControl,
+    ) -> Telemetry:
+        """Use a vertical takeoff corridor before enforcing the cruise altitude floor."""
+        profile = self.simulator.active_profile
+        adapter = self.simulator.adapter
+        assert profile and adapter
+        target = Vec3(
+            x=home.x,
+            y=home.y,
+            z=home.z - abs(zone.search_altitude_m),
+        )
+        validate_position(self._to_home(target, home), zone, plan.safety)
+        await self._event(
+            "flight.phase",
+            {
+                "phase": "initial_climb",
+                "target_altitude_m": zone.search_altitude_m,
+                "message": f"原地爬升到 {zone.search_altitude_m:.1f} m 搜索高度",
+            },
+            run.id,
+        )
+        await adapter.request(
+            "move_to",
+            vehicle_name=profile.vehicle_name,
+            x=target.x,
+            y=target.y,
+            z=target.z,
+            speed=min(1.5, plan.safety.max_speed_mps),
+            timeout=30,
+        )
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            await self._handle_control(run, control)
+            telemetry = await self._telemetry(run)
+            relative = self._to_home(telemetry.position, home)
+            altitude = -relative.z
+            if altitude > plan.safety.max_altitude_m + 0.5:
+                raise SafetyViolation(
+                    f"altitude {altitude:.2f} m exceeded the takeoff corridor ceiling"
+                )
+            if not point_in_polygon(relative, zone.polygon):
+                raise SafetyViolation("vehicle left the search geofence during initial climb")
+            if distance(telemetry.position, target) <= 0.75:
+                await self._event(
+                    "flight.phase",
+                    {
+                        "phase": "initial_climb_complete",
+                        "altitude_m": altitude,
+                        "message": f"已到达 {altitude:.1f} m，开始覆盖搜索",
+                    },
+                    run.id,
+                )
+                return telemetry
+            await asyncio.sleep(0.2)
+        raise MissionError("vehicle did not reach the search altitude before timeout")
 
     async def _wait_position(
         self, run: RunRecord, target: Vec3, control: RunControl, timeout: float

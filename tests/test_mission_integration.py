@@ -79,6 +79,15 @@ class CollisionAdapter(MockVehicleAdapter):
         return payload
 
 
+class LowTakeoffAdapter(MockVehicleAdapter):
+    async def request(self, operation: str, **arguments):
+        if operation == "takeoff":
+            self.landed = False
+            self.position = self.position.model_copy(update={"z": -0.8})
+            return {"accepted": True}
+        return await super().request(operation, **arguments)
+
+
 async def run_case(tmp_path: Path, provider: ModelProvider, adapter=None):
     settings = Settings(
         host="127.0.0.1",
@@ -149,3 +158,10 @@ async def test_collision_enters_safe_hold(tmp_path: Path):
     assert current.state == RunState.FAILED
     assert "collision" in (current.error or "").lower()
     assert RunState.SAFE_HOLD.value in states
+
+
+@pytest.mark.asyncio
+async def test_low_takeoff_climbs_vertically_before_search(tmp_path: Path):
+    current, states = await run_case(tmp_path, MockProvider(), LowTakeoffAdapter())
+    assert current.state == RunState.SUCCEEDED, current.error
+    assert RunState.SEARCHING.value in states
