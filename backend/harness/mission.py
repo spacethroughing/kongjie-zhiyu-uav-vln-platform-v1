@@ -438,11 +438,11 @@ class MissionService:
                     if assessment.bbox_norm
                     else None,
                     "confidence": assessment.confidence,
-                    "message": "VLM 目标框已锁定，执行短基线安全复核",
+                    "message": "VLM 目标框已锁定，转向居中并刷新深度坐标",
                 },
                 run.id,
             )
-            return await self._verify_locked_candidate(
+            return await self._confirm_locked_candidate(
                 run,
                 plan,
                 zone,
@@ -454,7 +454,7 @@ class MissionService:
             )
         return None, observation_index
 
-    async def _verify_locked_candidate(
+    async def _confirm_locked_candidate(
         self,
         run: RunRecord,
         plan: MissionPlan,
@@ -504,6 +504,21 @@ class MissionService:
                 locked = centered
             elif len(candidates) > before:
                 locked = candidates[-1][0]
+                await self._event(
+                    "vision.confirmed",
+                    {
+                        "target": locked.model_dump(),
+                        "mode": "centered_single_view",
+                    },
+                    run.id,
+                )
+            else:
+                await self._event(
+                    "vision.rejected",
+                    {"reason": "centered target frame did not produce valid depth localization"},
+                    run.id,
+                )
+                return None, observation_index
             await self._event(
                 "vision.lock_refined",
                 {
@@ -512,7 +527,7 @@ class MissionService:
                     "bbox_norm": assessment.bbox_norm.model_dump()
                     if assessment.bbox_norm
                     else None,
-                    "message": "目标已居中，使用刷新后的深度坐标执行短基线复核",
+                    "message": "目标已居中，使用刷新后的深度坐标直接安全接近",
                 },
                 run.id,
             )
@@ -522,79 +537,13 @@ class MissionService:
                 {"consecutive_failures": 1, "error": f"{type(error).__name__}: {error}"},
                 run.id,
             )
-            telemetry = await self._telemetry(run)
-        dx = locked.x - telemetry.position.x
-        dy = locked.y - telemetry.position.y
-        horizontal = math.hypot(dx, dy)
-        if horizontal < 1e-6:
-            return None, observation_index
-        baseline = zone.initial_verify_baseline_m
-        offsets = [(-dy / horizontal * baseline, dx / horizontal * baseline)]
-        offsets.append((-offsets[0][0], -offsets[0][1]))
-        verify_point = None
-        for offset_x, offset_y in offsets:
-            candidate = Vec3(
-                x=telemetry.position.x + offset_x,
-                y=telemetry.position.y + offset_y,
-                z=telemetry.position.z,
-            )
-            try:
-                validate_position(self._to_home(candidate, home), zone, plan.safety)
-            except SafetyViolation:
-                continue
-            verify_point = candidate
-            break
-        if verify_point is None:
-            await self._event(
-                "vision.rejected", {"reason": "no safe baseline verification point"}, run.id
-            )
-            return None, observation_index
-        await self._event(
-            "flight.phase",
-            {
-                "phase": "locked_baseline",
-                "message": f"目标已锁定，横移 {baseline:.1f} m 获取第二视角",
-            },
-            run.id,
-        )
-        await self._move_segmented(
-            run,
-            plan,
-            zone,
-            verify_point,
-            home,
-            control,
-            speed=min(2.0, plan.safety.max_speed_mps),
-        )
-        yaw = math.degrees(
-            math.atan2(locked.y - verify_point.y, locked.x - verify_point.x)
-        )
-        await adapter.request(
-            "rotate_yaw", vehicle_name=profile.vehicle_name, yaw_degrees=yaw, timeout=10
-        )
-        await asyncio.sleep(0.05 if profile.mode == "mock" else 0.7)
-        observation_index += 1
-        try:
-            frame, telemetry, assessment = await self._capture_assessment(
-                run, plan, observation_index
-            )
-        except Exception as error:
-            await self._event(
-                "model.error",
-                {"consecutive_failures": 1, "error": f"{type(error).__name__}: {error}"},
-                run.id,
-            )
-            return None, observation_index
-        confirmed = await self._evaluate_candidate(
-            run, plan, zone, frame, telemetry, assessment, candidates, home
-        )
-        if not confirmed:
             await self._event(
                 "vision.rejected",
-                {"reason": "locked target did not pass the second-view consistency check"},
+                {"reason": "failed to refresh the centered target lock"},
                 run.id,
             )
-        return confirmed, observation_index
+            return None, observation_index
+        return locked, observation_index
 
     async def _evaluate_candidate(
         self,
@@ -655,7 +604,14 @@ class MissionService:
             raise SafetyViolation("lidar clearance is below the configured minimum")
         run = await self._set_state(run, RunState.APPROACHING, target_position=target)
         await self._move_segmented(
-            run, plan, zone, approach, home, control, speed=plan.safety.approach_speed_mps
+            run,
+            plan,
+            zone,
+            approach,
+            home,
+            control,
+            speed=plan.safety.approach_speed_mps,
+            look_at=target,
         )
         await adapter.request("hover", timeout=4, vehicle_name=profile.vehicle_name)
         evidence = await adapter.capture(profile.vehicle_name)
@@ -713,6 +669,7 @@ class MissionService:
         home: Vec3,
         control: RunControl,
         speed: float | None = None,
+        look_at: Vec3 | None = None,
     ) -> None:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
@@ -734,20 +691,30 @@ class MissionService:
                 z=start.z + (target.z - start.z) * ratio,
             )
             validate_position(self._to_home(point, home), zone, plan.safety)
+            arguments: dict[str, float | str] = {
+                "vehicle_name": profile.vehicle_name,
+                "x": point.x,
+                "y": point.y,
+                "z": point.z,
+                "speed": min(speed or plan.safety.max_speed_mps, plan.safety.max_speed_mps),
+            }
+            if look_at is not None:
+                dx = look_at.x - telemetry.position.x
+                dy = look_at.y - telemetry.position.y
+                if math.hypot(dx, dy) > 1e-6:
+                    arguments["yaw_degrees"] = math.degrees(math.atan2(dy, dx))
             await adapter.request(
                 "move_to",
-                vehicle_name=profile.vehicle_name,
-                x=point.x,
-                y=point.y,
-                z=point.z,
-                speed=min(speed or plan.safety.max_speed_mps, plan.safety.max_speed_mps),
                 timeout=20,
+                **arguments,
             )
             # SimpleFlight can resolve a short moveToPosition future about
             # 1.2 m from its requested point at cruise speed. Intermediate
             # segments use a matching acceptance radius; every telemetry
             # sample is still checked against the full safety envelope.
-            await self._wait_position(run, point, control, timeout=20, tolerance=1.5)
+            telemetry = await self._wait_position(
+                run, point, control, timeout=20, tolerance=1.5
+            )
 
     async def _climb_to_search_altitude(
         self,

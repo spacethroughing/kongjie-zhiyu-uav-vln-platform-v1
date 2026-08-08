@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -134,6 +135,19 @@ class GroundContactBeforeLandedAdapter(MockVehicleAdapter):
         return payload
 
 
+class HeadingRecordingAdapter(MockVehicleAdapter):
+    def __init__(self):
+        super().__init__()
+        self.target_heading_moves = []
+
+    async def request(self, operation: str, **arguments):
+        if operation == "move_to" and "yaw_degrees" in arguments:
+            self.target_heading_moves.append(
+                {"origin": self.position.model_dump(), **dict(arguments)}
+            )
+        return await super().request(operation, **arguments)
+
+
 async def run_case(tmp_path: Path, provider: ModelProvider, adapter=None, panorama=False):
     settings = Settings(
         host="127.0.0.1",
@@ -152,7 +166,6 @@ async def run_case(tmp_path: Path, provider: ModelProvider, adapter=None, panora
     simulator = SimulatorManager(load_scenes(settings.scenes_file), events)
     if panorama:
         simulator.profiles["mock"].zones[0].initial_panorama_yaws_deg = [0, 45, 90]
-        simulator.profiles["mock"].zones[0].initial_verify_baseline_m = 4
     missions = MissionService(settings, store, events, simulator, provider)
     await simulator.start("mock")
     if adapter is not None:
@@ -224,10 +237,38 @@ async def test_short_segments_accept_simpleflight_completion_radius(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_initial_panorama_locks_then_verifies_before_coverage(tmp_path: Path):
-    current, states = await run_case(tmp_path, MockProvider(), panorama=True)
+async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_path: Path):
+    adapter = HeadingRecordingAdapter()
+    current, states = await run_case(tmp_path, MockProvider(), adapter=adapter, panorama=True)
     assert current.state == RunState.SUCCEEDED, current.error
     assert RunState.VERIFYING.value in states
+    assert current.target_position is not None
+    assert adapter.target_heading_moves
+    for move in adapter.target_heading_moves:
+        expected_yaw = math.degrees(
+            math.atan2(
+                current.target_position.y - move["origin"]["y"],
+                current.target_position.x - move["origin"]["x"],
+            )
+        )
+        angular_error = abs((move["yaw_degrees"] - expected_yaw + 180) % 360 - 180)
+        assert angular_error < 1e-6
+    final_move = adapter.target_heading_moves[-1]
+    assert math.hypot(
+        final_move["x"] - current.target_position.x,
+        final_move["y"] - current.target_position.y,
+    ) == pytest.approx(3.0)
+    events = [
+        json.loads(line)
+        for line in (Path(current.artifact_dir) / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert not any(
+        event["topic"] == "flight.phase"
+        and event["payload"].get("phase") == "locked_baseline"
+        for event in events
+    )
 
 
 @pytest.mark.asyncio

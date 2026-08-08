@@ -49,6 +49,12 @@ def execute_command(task, issued):
                 task["yaw_degrees"], task["margin"], task["timeout"], vehicle
             )
         elif operation == "move_to":
+            yaw_degrees = task.get("yaw_degrees")
+            yaw_mode = (
+                airsim.YawMode(True, 0)
+                if yaw_degrees is None
+                else airsim.YawMode(False, yaw_degrees)
+            )
             future = client.moveToPositionAsync(
                 task["x"],
                 task["y"],
@@ -56,7 +62,7 @@ def execute_command(task, issued):
                 task["speed"],
                 task["timeout"],
                 airsim.DrivetrainType.MaxDegreeOfFreedom,
-                airsim.YawMode(False, task["yaw_degrees"]),
+                yaw_mode,
                 -1,
                 1,
                 vehicle,
@@ -193,7 +199,9 @@ class Bridge(object):
             z = float(arguments["z"])
             speed = float(arguments["speed"])
             timeout = float(arguments.get("timeout", 30))
-            yaw = float(arguments.get("yaw_degrees", 0))
+            yaw = arguments.get("yaw_degrees")
+            if yaw is not None:
+                yaw = float(yaw)
             self._start_command(
                 {
                     "operation": operation,

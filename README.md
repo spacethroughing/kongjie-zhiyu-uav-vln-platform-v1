@@ -6,7 +6,7 @@
 
 - Blocks / CityPark 场景白名单与一键托管
 - 任务计划预览和人工批准后执行
-- 单机 `SimpleFlight` 覆盖搜索、多视角确认、深度定位、受限接近、取证和返航
+- 单机 `SimpleFlight` 覆盖搜索、目标居中深度定位、朝向锁定接近、取证和返航
 - OpenAI-compatible 多模态适配器和无需密钥的 Mock Provider
 - Python 3.7 AirSim JSONL 隔离桥，现代控制面使用 Python 3.11
 - React 控制台、实时状态/遥测/事件、暂停、返航、降落、终止和硬停
