@@ -5,6 +5,33 @@ import type { HarnessEvent, MissionPlan, Run, Scene, Telemetry } from "./types";
 
 const terminal = new Set(["SUCCEEDED", "FAILED", "ABORTED", "NOT_FOUND"]);
 
+function eventSummary(event: HarnessEvent): string {
+  const payload = event.payload;
+  if (event.topic === "snapshot") {
+    const runCount = Array.isArray(payload.runs) ? payload.runs.length : 0;
+    return `WebSocket 已连接 · 仿真 ${payload.simulator_state ?? "UNKNOWN"} · 历史运行 ${runCount}`;
+  }
+  if (typeof payload.message === "string") return payload.message;
+  if (typeof payload.error === "string" && payload.error) return payload.error;
+  if (typeof payload.state === "string") {
+    const scene = typeof payload.scene_id === "string" ? ` · ${payload.scene_id}` : "";
+    return `状态切换为 ${payload.state}${scene}`;
+  }
+  if (typeof payload.phase === "string") return `阶段：${payload.phase}`;
+  if (typeof payload.action === "string") return `控制指令：${payload.action}`;
+  if (event.topic === "frame.preview") return `收到 ${payload.width ?? "?"}×${payload.height ?? "?"} 画面`;
+  if (event.topic === "telemetry") return "遥测已更新";
+  const compact = JSON.stringify(payload);
+  return compact.length > 150 ? `${compact.slice(0, 147)}…` : compact;
+}
+
+function eventLevel(event: HarnessEvent): "info" | "warning" | "error" | "success" {
+  if (event.payload.level === "error" || event.topic.includes("failed")) return "error";
+  if (event.payload.level === "warning" || event.topic.includes("rejected")) return "warning";
+  if (event.topic.includes("confirmed") || event.payload.phase === "completed") return "success";
+  return "info";
+}
+
 export default function App() {
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [sceneId, setSceneId] = useState("mock");
@@ -79,6 +106,8 @@ export default function App() {
 
   const latest = telemetryPath.at(-1);
   const active = run && !terminal.has(run.state);
+  const currentState = active ? run.state : simState === "READY" ? "READY" : "IDLE";
+  const logEvents = events.filter((event) => !["telemetry", "frame.preview"].includes(event.topic));
 
   return (
     <main>
@@ -133,7 +162,7 @@ export default function App() {
         <aside className="right-stack">
           <article className="panel run-panel">
             <div className="panel-title"><span>RUN</span><h2>执行控制</h2></div>
-            <div className={`state-card state-${run?.state?.toLowerCase() ?? "idle"}`}><small>CURRENT STATE</small><strong>{run?.state ?? "IDLE"}</strong><code>{run?.id?.slice(0, 13) ?? "no active run"}</code></div>
+            <div className={`state-card state-${currentState.toLowerCase()}`}><small>CURRENT STATE</small><strong>{currentState}</strong><code>{active ? run.id.slice(0, 13) : run ? `历史 ${run.state} · ${run.id.slice(0, 13)}` : "no active run"}</code></div>
             <div className="controls">
               <button disabled={!active || run?.state === "PAUSED"} onClick={() => act(() => api.control(run!.id, "pause"))}>暂停</button>
               <button disabled={run?.state !== "PAUSED"} onClick={() => act(() => api.control(run!.id, "resume"))}>继续</button>
@@ -146,12 +175,11 @@ export default function App() {
           </article>
 
           <article className="panel events-panel">
-            <div className="panel-title"><span>LOG</span><h2>任务时间线</h2></div>
-            <div className="event-list">{events.length ? events.map((event) => <div className="event" key={`${event.sequence}-${event.topic}`}><time>{event.timestamp ? new Date(event.timestamp).toLocaleTimeString() : "—"}</time><span>{event.topic}</span><small>#{event.sequence}</small></div>) : <div className="empty">等待系统事件</div>}</div>
+            <div className="panel-title"><span>LOG</span><h2>实时日志</h2><button className="log-clear" onClick={() => setEvents([])}>清空</button></div>
+            <div className="event-list">{logEvents.length ? logEvents.map((event) => <div className={`event level-${eventLevel(event)}`} key={`${event.sequence}-${event.topic}`}><div className="event-head"><time>{event.timestamp ? new Date(event.timestamp).toLocaleTimeString() : "—"}</time><span>{event.topic}</span><small>#{event.sequence}</small></div><p>{eventSummary(event)}</p></div>) : <div className="empty">等待系统日志</div>}</div>
           </article>
         </aside>
       </section>
     </main>
   );
 }
-

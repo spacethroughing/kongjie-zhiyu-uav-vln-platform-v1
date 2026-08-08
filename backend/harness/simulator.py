@@ -25,6 +25,7 @@ class SimulatorManager:
         self.process: asyncio.subprocess.Process | None = None
         self.state = "STOPPED"
         self._lock = asyncio.Lock()
+        self._preview_task: asyncio.Task | None = None
 
     async def start(self, scene_id: str) -> SceneProfile:
         async with self._lock:
@@ -66,6 +67,9 @@ class SimulatorManager:
                 await self._wait_ready(profile)
                 self.state = "READY"
                 await self.events.publish("simulator.state", {"state": self.state, "scene_id": scene_id})
+                self._preview_task = asyncio.create_task(
+                    self._stream_preview(profile), name=f"preview-{scene_id}"
+                )
                 return profile
             except Exception:
                 await self._stop_unlocked(hard=True)
@@ -241,6 +245,10 @@ class SimulatorManager:
 
     async def _stop_unlocked(self, hard: bool) -> None:
         profile = self.active_profile
+        preview_task, self._preview_task = self._preview_task, None
+        if preview_task:
+            preview_task.cancel()
+            await asyncio.gather(preview_task, return_exceptions=True)
         adapter, self.adapter = self.adapter, None
         if adapter:
             if not hard and profile:
@@ -272,6 +280,54 @@ class SimulatorManager:
         await self.events.publish(
             "simulator.state", {"state": self.state, "scene_id": profile.id if profile else None}
         )
+
+    async def _stream_preview(self, profile: SceneProfile) -> None:
+        """Publish a low-rate live preview while the allowlisted scene is READY."""
+        await self.events.publish(
+            "system.log",
+            {"level": "info", "message": f"{profile.name} 实时预览已启动", "source": "preview"},
+        )
+        consecutive_failures = 0
+        try:
+            while (
+                self.state == "READY"
+                and self.active_profile is profile
+                and self.adapter is not None
+            ):
+                try:
+                    telemetry = await self.adapter.telemetry(profile.vehicle_name)
+                    await self.events.publish("telemetry", telemetry.model_dump(mode="json"))
+                    frame = await self.adapter.capture(profile.vehicle_name)
+                    await self.events.publish(
+                        "frame.preview",
+                        {
+                            "frame_id": frame.frame_id,
+                            "data_url": f"data:image/png;base64,{frame.scene_png_b64}",
+                            "width": frame.width,
+                            "height": frame.height,
+                            "source": "live_preview",
+                        },
+                    )
+                    consecutive_failures = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    consecutive_failures += 1
+                    await self.events.publish(
+                        "system.log",
+                        {
+                            "level": "error" if consecutive_failures >= 3 else "warning",
+                            "message": f"实时预览取帧失败：{type(error).__name__}: {error}",
+                            "source": "preview",
+                            "consecutive_failures": consecutive_failures,
+                        },
+                    )
+                await asyncio.sleep(0.75 if profile.mode == "mock" else 1.0)
+        finally:
+            await self.events.publish(
+                "system.log",
+                {"level": "info", "message": f"{profile.name} 实时预览已停止", "source": "preview"},
+            )
 
     async def close(self) -> None:
         await self.stop(hard=False)
