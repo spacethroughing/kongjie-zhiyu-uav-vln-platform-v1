@@ -96,6 +96,11 @@ def choose_local_detour(
     dy = goal.y - start.y
     heading = math.atan2(dy, dx)
     step = max(2.5, step_m)
+    distance_to_goal = math.sqrt(
+        dx * dx + dy * dy + (goal.z - start.z) * (goal.z - start.z)
+    )
+    altitude_ratio = min(1.0, step / max(distance_to_goal, 1e-9))
+    waypoint_z = start.z + (goal.z - start.z) * altitude_ratio
     angle_magnitudes = (40.0, 55.0, 70.0, 90.0, 110.0)
     sides = (
         (preferred_side, -preferred_side)
@@ -109,7 +114,7 @@ def choose_local_detour(
             waypoint = Vec3(
                 x=start.x + math.cos(angle) * step,
                 y=start.y + math.sin(angle) * step,
-                z=goal.z,
+                z=waypoint_z,
             )
             if not is_segment_allowed(start, waypoint):
                 continue

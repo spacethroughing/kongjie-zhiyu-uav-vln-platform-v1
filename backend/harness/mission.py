@@ -194,7 +194,6 @@ class MissionService:
         control = self._controls[run.id]
         zone = self._zone(plan)
         found = False
-        candidate_positions: list[tuple[Vec3, Vec3]] = []
         observation_index = 0
         consecutive_model_failures = 0
         try:
@@ -231,18 +230,15 @@ class MissionService:
                 zone,
                 home,
                 control,
-                candidate_positions,
                 observation_index,
             )
             if confirmed:
-                run = await self._set_state(run, RunState.VERIFYING, target_position=confirmed)
                 accepted = await self._approach_and_review(
                     run, plan, zone, confirmed, home, control
                 )
                 if accepted:
                     found = True
                 else:
-                    candidate_positions.clear()
                     run = self.store.get_run(run.id) or run
                     run = await self._set_state(run, RunState.SEARCHING)
 
@@ -280,19 +276,15 @@ class MissionService:
                             raise MissionError("three consecutive model calls failed") from error
                         continue
                     confirmed = await self._evaluate_candidate(
-                        run, plan, zone, frame, telemetry, assessment, candidate_positions, home
+                        run, plan, zone, frame, telemetry, assessment, home
                     )
                     if confirmed:
-                        run = await self._set_state(
-                            run, RunState.VERIFYING, target_position=confirmed
-                        )
                         accepted = await self._approach_and_review(
                             run, plan, zone, confirmed, home, control
                         )
                         if accepted:
                             found = True
                             break
-                        candidate_positions.clear()
                         run = self.store.get_run(run.id) or run
                         run = await self._set_state(run, RunState.SEARCHING)
                 if found or control.return_home.is_set() or control.land.is_set():
@@ -392,7 +384,6 @@ class MissionService:
         zone: SearchZone,
         home: Vec3,
         control: RunControl,
-        candidates: list[tuple[Vec3, Vec3]],
         observation_index: int,
     ) -> tuple[Vec3 | None, int]:
         profile = self.simulator.active_profile
@@ -437,13 +428,11 @@ class MissionService:
                 if consecutive_failures >= 3:
                     raise MissionError("three consecutive model calls failed") from error
                 continue
-            before = len(candidates)
-            await self._evaluate_candidate(
-                run, plan, zone, frame, telemetry, assessment, candidates, home
+            locked = await self._evaluate_candidate(
+                run, plan, zone, frame, telemetry, assessment, home
             )
-            if len(candidates) == before:
+            if locked is None:
                 continue
-            locked = candidates[-1][0]
             await self._event(
                 "vision.locked",
                 {
@@ -453,128 +442,13 @@ class MissionService:
                     if assessment.bbox_norm
                     else None,
                     "confidence": assessment.confidence,
-                    "message": "VLM 目标框已锁定，转向居中并刷新深度坐标",
+                    "mode": "single_frame_depth",
+                    "message": "VLM 单帧目标框已锁定，立即进入安全接近",
                 },
                 run.id,
             )
-            return await self._confirm_locked_candidate(
-                run,
-                plan,
-                zone,
-                home,
-                control,
-                candidates,
-                locked,
-                observation_index,
-            )
+            return locked, observation_index
         return None, observation_index
-
-    async def _confirm_locked_candidate(
-        self,
-        run: RunRecord,
-        plan: MissionPlan,
-        zone: SearchZone,
-        home: Vec3,
-        control: RunControl,
-        candidates: list[tuple[Vec3, Vec3]],
-        locked: Vec3,
-        observation_index: int,
-    ) -> tuple[Vec3 | None, int]:
-        profile = self.simulator.active_profile
-        adapter = self.simulator.adapter
-        assert profile and adapter
-        telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
-        center_yaw = math.degrees(
-            math.atan2(
-                locked.y - telemetry.position.y,
-                locked.x - telemetry.position.x,
-            )
-        )
-        await self._event(
-            "flight.phase",
-            {
-                "phase": "locked_centering",
-                "message": "目标已锁定，先转向使候选框居中并刷新深度坐标",
-                "yaw_degrees": center_yaw,
-            },
-            run.id,
-        )
-        await adapter.request(
-            "rotate_yaw",
-            vehicle_name=profile.vehicle_name,
-            yaw_degrees=center_yaw,
-            timeout=10,
-        )
-        await asyncio.sleep(0.05 if profile.mode == "mock" else 0.7)
-        observation_index += 1
-        try:
-            frame, telemetry, assessment = await self._capture_assessment(
-                run, plan, zone, home, observation_index
-            )
-            before = len(candidates)
-            centered = await self._evaluate_candidate(
-                run, plan, zone, frame, telemetry, assessment, candidates, home
-            )
-            if centered:
-                locked = centered
-            elif len(candidates) > before:
-                refined = candidates[-1][0]
-                position_delta = distance(locked, refined)
-                if position_delta > 3.0:
-                    await self._event(
-                        "vision.rejected",
-                        {
-                            "reason": "centered depth position is inconsistent with the initial lock",
-                            "initial_target": self._to_home(locked, home).model_dump(),
-                            "refined_target": self._to_home(refined, home).model_dump(),
-                            "position_delta_m": position_delta,
-                            "message": f"居中复核位置偏差 {position_delta:.1f} m，拒绝接近",
-                        },
-                        run.id,
-                    )
-                    return None, observation_index
-                locked = refined
-                await self._event(
-                    "vision.confirmed",
-                    {
-                        "target": locked.model_dump(),
-                        "mode": "centered_single_view",
-                        "position_delta_m": position_delta,
-                    },
-                    run.id,
-                )
-            else:
-                await self._event(
-                    "vision.rejected",
-                    {"reason": "centered target frame did not produce valid depth localization"},
-                    run.id,
-                )
-                return None, observation_index
-            await self._event(
-                "vision.lock_refined",
-                {
-                    "target": locked.model_dump(),
-                    "frame_id": frame.frame_id,
-                    "bbox_norm": assessment.bbox_norm.model_dump()
-                    if assessment.bbox_norm
-                    else None,
-                    "message": "目标已居中，使用刷新后的深度坐标直接安全接近",
-                },
-                run.id,
-            )
-        except Exception as error:
-            await self._event(
-                "model.error",
-                {"consecutive_failures": 1, "error": f"{type(error).__name__}: {error}"},
-                run.id,
-            )
-            await self._event(
-                "vision.rejected",
-                {"reason": "failed to refresh the centered target lock"},
-                run.id,
-            )
-            return None, observation_index
-        return locked, observation_index
 
     async def _evaluate_candidate(
         self,
@@ -584,7 +458,6 @@ class MissionService:
         frame: CameraFrame,
         telemetry: Telemetry,
         assessment: DetectionAssessment,
-        candidates: list[tuple[Vec3, Vec3]],
         home: Vec3,
     ) -> Vec3 | None:
         if not assessment.is_match or assessment.confidence < 0.75 or not assessment.bbox_norm:
@@ -610,17 +483,17 @@ class MissionService:
                 run.id,
             )
             return None
-        for previous_target, previous_camera in candidates:
-            if distance(previous_camera, frame.camera_position) >= 0.5 and distance(previous_target, target) <= 3.0:
-                average = Vec3(
-                    x=(previous_target.x + target.x) / 2,
-                    y=(previous_target.y + target.y) / 2,
-                    z=(previous_target.z + target.z) / 2,
-                )
-                await self._event("vision.confirmed", {"target": average.model_dump()}, run.id)
-                return average
-        candidates.append((target, frame.camera_position))
-        return None
+        await self._event(
+            "vision.confirmed",
+            {
+                "target": target.model_dump(),
+                "mode": "single_frame_depth",
+                "confidence": assessment.confidence,
+                "message": "单帧 VLM 匹配和初始深度定位有效，跳过居中与二次深度复核",
+            },
+            run.id,
+        )
+        return target
 
     async def _approach_and_review(
         self,

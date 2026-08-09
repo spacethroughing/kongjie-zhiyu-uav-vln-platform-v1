@@ -67,7 +67,11 @@ class FailingProvider(ModelProvider):
 class InconsistentCenteredProvider(ModelProvider):
     name = "inconsistent-centered"
 
+    def __init__(self):
+        self.observations = []
+
     async def inspect(self, frame, target_text, telemetry, observation_index):
+        self.observations.append(observation_index)
         boxes = {
             2: BoundingBox(x_min=0.4, y_min=0.4, x_max=0.6, y_max=0.6),
             3: BoundingBox(x_min=0.8, y_min=0.4, x_max=0.98, y_max=0.6),
@@ -305,7 +309,7 @@ async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_pa
     adapter = HeadingRecordingAdapter()
     current, states = await run_case(tmp_path, MockProvider(), adapter=adapter, panorama=True)
     assert current.state == RunState.SUCCEEDED, current.error
-    assert RunState.VERIFYING.value in states
+    assert RunState.VERIFYING.value not in states
     assert current.target_position is not None
     assert adapter.target_heading_moves
     approach_moves = [
@@ -340,12 +344,15 @@ async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_inconsistent_centered_depth_never_approaches(tmp_path: Path):
-    current, states = await run_case(tmp_path, InconsistentCenteredProvider(), panorama=True)
-    assert current.state == RunState.NOT_FOUND, current.error
-    assert RunState.APPROACHING.value not in states
+async def test_single_frame_lock_skips_centering_and_second_depth_check(tmp_path: Path):
+    provider = InconsistentCenteredProvider()
+    current, states = await run_case(tmp_path, provider, panorama=True)
+    assert current.state == RunState.SUCCEEDED, current.error
+    assert RunState.APPROACHING.value in states
+    assert provider.observations == [1, 2]
     events = (Path(current.artifact_dir) / "events.jsonl").read_text(encoding="utf-8")
-    assert "centered depth position is inconsistent" in events
+    assert "locked_centering" not in events
+    assert '"mode":"single_frame_depth"' in events
 
 
 @pytest.mark.asyncio
