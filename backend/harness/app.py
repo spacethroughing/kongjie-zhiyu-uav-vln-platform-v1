@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -18,6 +19,9 @@ from .models import (
     CandidateDecision,
     HealthResponse,
     MissionPlan,
+    ProviderConfigRequest,
+    ProviderConfigResponse,
+    ProviderModelOption,
     RunRecord,
     RunState,
     SearchMissionRequest,
@@ -44,6 +48,7 @@ class ApplicationServices:
                 )
         self.simulator = SimulatorManager(self.profiles, self.events)
         self.provider = create_provider(self.settings)
+        self.provider_config_lock = asyncio.Lock()
         self.missions = MissionService(
             self.settings, self.store, self.events, self.simulator, self.provider
         )
@@ -52,6 +57,93 @@ class ApplicationServices:
         await self.missions.close()
         await self.simulator.close()
         self.store.close()
+
+    def active_runs(self) -> list[RunRecord]:
+        return [run for run in self.store.list_runs() if run.state not in TERMINAL_STATES]
+
+    def provider_config(self) -> ProviderConfigResponse:
+        return ProviderConfigResponse(
+            provider=self.provider.name,
+            base_url=self.settings.llm_base_url,
+            model=self.settings.llm_model or "mock",
+            api_key_configured=bool(self.settings.llm_api_key),
+            runtime_only=True,
+            models=ZHIPU_VISION_MODELS,
+        )
+
+    async def configure_provider(
+        self, request: ProviderConfigRequest
+    ) -> ProviderConfigResponse:
+        async with self.provider_config_lock:
+            if self.active_runs():
+                raise MissionError("cannot change the VLM provider during an active mission")
+            supplied_key = (
+                request.api_key.get_secret_value().strip() if request.api_key else ""
+            )
+            api_key = supplied_key or self.settings.llm_api_key
+            if not api_key:
+                raise ValueError("API Key is required because no backend key is configured")
+            next_settings = replace(
+                self.settings,
+                provider="openai-compatible",
+                llm_base_url=ZHIPU_BASE_URL,
+                llm_model=request.model,
+                llm_api_key=api_key,
+            )
+            candidate = create_provider(next_settings)
+            try:
+                await candidate.probe()
+            except Exception:
+                await candidate.close()
+                raise
+            if self.active_runs():
+                await candidate.close()
+                raise MissionError("a mission started while the VLM was being verified")
+            previous = self.provider
+            self.settings = next_settings
+            self.provider = candidate
+            self.missions.settings = next_settings
+            self.missions.provider = candidate
+            await previous.close()
+            await self.events.publish(
+                "provider.configured",
+                {
+                    "provider": candidate.name,
+                    "model": request.model,
+                    "api_key_configured": True,
+                    "message": f"VLM 已切换为 {request.model}；API Key 仅保存在后端内存",
+                },
+            )
+            return self.provider_config()
+
+
+ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+ZHIPU_VISION_MODELS = [
+    ProviderModelOption(
+        id="glm-4.6v-flashx",
+        name="GLM-4.6V-FlashX",
+        description="轻量高速视觉模型",
+        billing="paid",
+    ),
+    ProviderModelOption(
+        id="glm-4.6v-flash",
+        name="GLM-4.6V-Flash",
+        description="免费视觉模型，高峰期可能限流",
+        billing="free",
+    ),
+    ProviderModelOption(
+        id="glm-4.6v",
+        name="GLM-4.6V",
+        description="高性能视觉推理模型",
+        billing="paid",
+    ),
+    ProviderModelOption(
+        id="glm-5v-turbo",
+        name="GLM-5V-Turbo",
+        description="高性能多模态 Agent 模型",
+        billing="paid",
+    ),
+]
 
 
 @asynccontextmanager
@@ -119,9 +211,29 @@ async def probe_provider():
         raise HTTPException(status_code=424, detail=f"model capability probe failed: {error}") from error
 
 
+@app.get("/api/provider/config", response_model=ProviderConfigResponse)
+async def get_provider_config() -> ProviderConfigResponse:
+    return services().provider_config()
+
+
+@app.put("/api/provider/config", response_model=ProviderConfigResponse)
+async def configure_provider(request: ProviderConfigRequest) -> ProviderConfigResponse:
+    try:
+        return await services().configure_provider(request)
+    except MissionError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=424,
+            detail=f"new model capability probe failed; previous provider was kept: {error}",
+        ) from error
+
+
 @app.post("/api/simulator/stop", response_model=ApiMessage)
 async def stop_simulator() -> ApiMessage:
-    active = [run for run in services().store.list_runs() if run.state not in TERMINAL_STATES]
+    active = services().active_runs()
     if active:
         raise HTTPException(status_code=409, detail="an active mission must be aborted before stopping the simulator")
     await services().simulator.stop(hard=False)

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import { MapView } from "./MapView";
-import type { HarnessEvent, MissionPlan, Run, SafetyBounds, Scene, Telemetry, Zone } from "./types";
+import type { HarnessEvent, MissionPlan, ProviderConfig, Run, SafetyBounds, Scene, Telemetry, Zone } from "./types";
 
 const terminal = new Set(["SUCCEEDED", "FAILED", "ABORTED", "NOT_FOUND"]);
 
@@ -64,6 +64,9 @@ export default function App() {
   const [zoneId, setZoneId] = useState("");
   const [simState, setSimState] = useState("STOPPED");
   const [provider, setProvider] = useState("-");
+  const [providerConfig, setProviderConfig] = useState<ProviderConfig>();
+  const [selectedModel, setSelectedModel] = useState("glm-4.6v-flashx");
+  const [apiKey, setApiKey] = useState("");
   const [targetText, setTargetText] = useState("明亮的红色立方体");
   const [plan, setPlan] = useState<MissionPlan>();
   const [run, setRun] = useState<Run>();
@@ -92,11 +95,13 @@ export default function App() {
   }
 
   useEffect(() => {
-    Promise.all([api.scenes(), api.health(), api.runs()])
-      .then(([loadedScenes, health, runs]) => {
+    Promise.all([api.scenes(), api.health(), api.runs(), api.providerConfig()])
+      .then(([loadedScenes, health, runs, loadedProviderConfig]) => {
         setScenes(loadedScenes);
         setSimState(health.simulator_state);
         setProvider(health.provider);
+        setProviderConfig(loadedProviderConfig);
+        setSelectedModel(loadedProviderConfig.model);
         if (health.active_scene_id) setSceneId(health.active_scene_id);
         if (runs[0]) setRun(runs[0]);
       })
@@ -135,6 +140,16 @@ export default function App() {
           setPreview(String(event.payload.data_url));
         } else if (event.topic === "vision.assessment") {
           setCandidateBox((event.payload.bbox_norm as typeof candidateBox) ?? undefined);
+        } else if (event.topic === "provider.configured") {
+          const model = String(event.payload.model);
+          setProvider(String(event.payload.provider));
+          setSelectedModel(model);
+          setProviderConfig((current) => current ? {
+            ...current,
+            provider: String(event.payload.provider),
+            model,
+            api_key_configured: Boolean(event.payload.api_key_configured),
+          } : current);
         }
       };
       socket.onclose = () => { reconnect.current = window.setTimeout(connect, 1500); };
@@ -174,6 +189,15 @@ export default function App() {
     if (revision === missionConfigRevision.current) setPlan(created);
   }
 
+  async function saveProviderConfig() {
+    const configured = await api.configureProvider(selectedModel, apiKey.trim() || undefined);
+    setProviderConfig(configured);
+    setProvider(configured.provider);
+    setSelectedModel(configured.model);
+    setApiKey("");
+    invalidatePlan();
+  }
+
   const latest = telemetryPath.at(-1);
   const active = run && !terminal.has(run.state);
   const currentState = active ? run.state : simState === "READY" ? "READY" : "IDLE";
@@ -183,13 +207,52 @@ export default function App() {
     <main>
       <header>
         <div className="brand"><span className="mark">A</span><div><h1>AIRSIM MISSION HARNESS</h1><p>LLM-assisted · deterministic flight safety</p></div></div>
-        <div className="status-line"><span className={`dot ${simState === "READY" ? "online" : ""}`} />{simState}<span className="provider">VLM · {provider}</span></div>
+        <div className="status-line"><span className={`dot ${simState === "READY" ? "online" : ""}`} />{simState}<span className="provider">VLM · {providerConfig?.model ?? provider}</span></div>
       </header>
 
       {error && <div className="error"><b>操作失败</b><span>{error}</span><button onClick={() => setError(undefined)}>×</button></div>}
 
       <section className="layout">
         <aside className="left-stack">
+          <article className="panel provider-panel">
+            <div className="panel-title"><span>VLM</span><h2>模型配置</h2><em>{providerConfig?.api_key_configured ? "KEY READY" : "NO KEY"}</em></div>
+            <label>视觉模型
+              <select
+                aria-label="视觉模型"
+                value={selectedModel}
+                disabled={busy || Boolean(active)}
+                onChange={(event) => setSelectedModel(event.target.value)}
+              >
+                {providerConfig?.models.map((model) => <option value={model.id} key={model.id}>
+                  {model.name} · {model.billing === "free" ? "免费" : "计费"}
+                </option>)}
+              </select>
+            </label>
+            <p className="model-description">
+              {providerConfig?.models.find((model) => model.id === selectedModel)?.description ?? "选择智谱视觉模型"}
+            </p>
+            <label>API Key
+              <input
+                className="api-key-input"
+                type="password"
+                name="runtime-api-key"
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="智谱 API Key"
+                value={apiKey}
+                placeholder={providerConfig?.api_key_configured ? "已配置；留空保留当前密钥" : "输入智谱 API Key"}
+                disabled={busy || Boolean(active)}
+                onChange={(event) => setApiKey(event.target.value)}
+              />
+            </label>
+            <button
+              className="provider-save"
+              disabled={busy || Boolean(active) || !selectedModel || (!providerConfig?.api_key_configured && !apiKey.trim())}
+              onClick={() => act(saveProviderConfig)}
+            >保存并探测能力</button>
+            <p className="secret-note">仅当前后端进程内存保存；页面不会回显密钥，任务运行中禁止切换。</p>
+          </article>
+
           <article className="panel mission-panel">
             <div className="panel-title"><span>01</span><h2>任务配置</h2></div>
             <label>仿真场景<select value={sceneId} disabled={simState !== "STOPPED"} onChange={(e) => { setSceneId(e.target.value); invalidatePlan(); }}>{scenes.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>

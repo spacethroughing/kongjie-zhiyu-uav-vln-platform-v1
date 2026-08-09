@@ -86,3 +86,19 @@ export type HarnessEvent = {
   timestamp?: string;
   payload: Record<string, unknown>;
 };
+
+export type ProviderModelOption = {
+  id: "glm-4.6v-flashx" | "glm-4.6v-flash" | "glm-4.6v" | "glm-5v-turbo";
+  name: string;
+  description: string;
+  billing: "free" | "paid";
+};
+
+export type ProviderConfig = {
+  provider: string;
+  base_url: string;
+  model: string;
+  api_key_configured: boolean;
+  runtime_only: boolean;
+  models: ProviderModelOption[];
+};

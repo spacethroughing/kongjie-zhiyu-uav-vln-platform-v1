@@ -1,0 +1,43 @@
+.provider-panel {
+  padding-bottom: 12px;
+}
+
+.provider-panel .panel-title {
+  margin-bottom: 7px;
+}
+
+.provider-panel label {
+  margin: 8px 0;
+}
+
+.provider-panel input[type="password"] {
+  width: 100%;
+  border: 1px solid #27453c;
+  background: #07100e;
+  color: #dcefe8;
+  padding: 9px;
+  outline: none;
+}
+
+.provider-panel input[type="password"]:focus {
+  border-color: #55bd96;
+  box-shadow: 0 0 0 2px rgba(103, 235, 187, 0.08);
+}
+
+.model-description {
+  margin: 3px 0 8px;
+  color: #76958a;
+  font: 9px/1.45 "IBM Plex Mono";
+}
+
+.provider-save {
+  width: 100%;
+  border-color: #459978;
+  background: #153f32;
+}
+
+.secret-note {
+  margin: 8px 0 0;
+  color: #607b71;
+  font: 8px/1.5 "IBM Plex Mono";
+}

@@ -1,4 +1,4 @@
-import type { MissionPlan, Run, SafetyBounds, Scene } from "./types";
+import type { MissionPlan, ProviderConfig, Run, SafetyBounds, Scene } from "./types";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -14,6 +14,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<{ simulator_state: string; active_scene_id?: string; provider: string }>("/api/health"),
+  providerConfig: () => request<ProviderConfig>("/api/provider/config"),
+  configureProvider: (model: string, api_key?: string) =>
+    request<ProviderConfig>("/api/provider/config", {
+      method: "PUT",
+      body: JSON.stringify({ model, ...(api_key ? { api_key } : {}) }),
+    }),
   scenes: () => request<Scene[]>("/api/scenes"),
   runs: () => request<Run[]>("/api/runs"),
   start: (scene_id: string) =>

@@ -9,6 +9,7 @@
 - Web 端 NED 地图拖拽/数值编辑任务级安全范围，并由场景硬上限约束
 - 单机 `SimpleFlight` 覆盖搜索、目标居中深度定位、朝向锁定接近、取证和返航
 - OpenAI-compatible 多模态适配器和无需密钥的 Mock Provider
+- Web 端可选择受控的智谱视觉模型并热更新 API Key；密钥只驻留后端内存且永不回显
 - Python 3.7 AirSim JSONL 隔离桥，现代控制面使用 Python 3.11
 - React 控制台、实时状态/遥测/事件、暂停、返航、降落、终止和硬停
 - SQLite 索引与每次运行独立的可回放工件
@@ -50,11 +51,13 @@ LLM_API_KEY=replace-me
 ```dotenv
 HARNESS_PROVIDER=openai-compatible
 LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-LLM_MODEL=glm-5v-turbo
+LLM_MODEL=glm-4.6v-flashx
 LLM_API_KEY=replace-me
 ```
 
-密钥只由后端读取，不会进入浏览器、运行清单或模型日志。
+Web 控制台也可在没有活动任务时选择模型、输入或替换 API Key。新配置会先通过视觉与 JSON Schema 能力探测再生效；探测失败时保留旧 Provider。浏览器不会通过接口回读密钥，也不写入 localStorage；通过 Web 输入的密钥只驻留当前后端进程内存，后端重启后需要重新输入或由 `.env` 提供。
+
+`GLM-4.6V-FlashX` 是轻量高速的计费模型；`GLM-4.6V-Flash` 才是免费模型。Web 下拉框会显示计费属性，实际价格以智谱平台为准。
 
 ## 安全边界
 

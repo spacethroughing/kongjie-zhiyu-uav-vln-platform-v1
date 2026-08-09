@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -319,3 +319,39 @@ class CandidateDecision(BaseModel):
 
 class JsonModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+ZhipuVisionModel = Literal[
+    "glm-4.6v-flashx",
+    "glm-4.6v-flash",
+    "glm-4.6v",
+    "glm-5v-turbo",
+]
+
+
+class ProviderConfigRequest(JsonModel):
+    model: ZhipuVisionModel
+    api_key: SecretStr | None = None
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def empty_key_keeps_current_key(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+
+class ProviderModelOption(JsonModel):
+    id: ZhipuVisionModel
+    name: str
+    description: str
+    billing: Literal["free", "paid"]
+
+
+class ProviderConfigResponse(JsonModel):
+    provider: str
+    base_url: str
+    model: str
+    api_key_configured: bool
+    runtime_only: bool = True
+    models: list[ProviderModelOption]
