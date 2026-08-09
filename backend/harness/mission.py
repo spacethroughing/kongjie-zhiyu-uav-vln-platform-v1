@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .avoidance import assess_corridor, choose_local_detour, decode_point_cloud
 from .config import Settings
 from .events import EventBus
 from .geometry import DepthLocalizationError, distance, localize_bbox
@@ -28,7 +29,13 @@ from .models import (
     utc_now,
 )
 from .planner import build_plan, resolve_search_zone
-from .safety import SafetyViolation, approach_point, point_in_polygon, validate_position, validate_telemetry
+from .safety import (
+    SafetyViolation,
+    approach_point,
+    point_in_polygon,
+    validate_position,
+    validate_telemetry,
+)
 from .simulator import SimulatorManager
 from .store import Store
 
@@ -256,7 +263,7 @@ class MissionService:
                     observation_index += 1
                     try:
                         frame, telemetry, assessment = await self._capture_assessment(
-                            run, plan, observation_index
+                            run, plan, zone, home, observation_index
                         )
                         consecutive_model_failures = 0
                     except Exception as error:
@@ -294,7 +301,10 @@ class MissionService:
             run = self.store.get_run(run.id) or run
             if control.land.is_set():
                 raise LandRequested("operator requested immediate landing")
-            run = await self._return_and_land(run, profile.vehicle_name, home)
+            control.return_home.clear()
+            run = await self._return_and_land(
+                run, plan, zone, profile.vehicle_name, home, control
+            )
             final_state = RunState.SUCCEEDED if found else RunState.NOT_FOUND
             run = await self._set_state(run, final_state, ended=True)
         except LandRequested:
@@ -336,7 +346,12 @@ class MissionService:
             self._tasks.pop(run.id, None)
 
     async def _capture_assessment(
-        self, run: RunRecord, plan: MissionPlan, observation_index: int
+        self,
+        run: RunRecord,
+        plan: MissionPlan,
+        zone: SearchZone,
+        home: Vec3,
+        observation_index: int,
     ) -> tuple[CameraFrame, Telemetry, DetectionAssessment]:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
@@ -353,7 +368,7 @@ class MissionService:
             },
             run.id,
         )
-        telemetry = await self._telemetry(run)
+        telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
         assessment = await self.provider.inspect(
             frame, plan.request.target_text, telemetry, observation_index
         )
@@ -406,7 +421,7 @@ class MissionService:
             observation_index += 1
             try:
                 frame, telemetry, assessment = await self._capture_assessment(
-                    run, plan, observation_index
+                    run, plan, zone, home, observation_index
                 )
                 consecutive_failures = 0
             except Exception as error:
@@ -468,7 +483,7 @@ class MissionService:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
         assert profile and adapter
-        telemetry = await self._telemetry(run)
+        telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
         center_yaw = math.degrees(
             math.atan2(
                 locked.y - telemetry.position.y,
@@ -494,7 +509,7 @@ class MissionService:
         observation_index += 1
         try:
             frame, telemetry, assessment = await self._capture_assessment(
-                run, plan, observation_index
+                run, plan, zone, home, observation_index
             )
             before = len(candidates)
             centered = await self._evaluate_candidate(
@@ -619,18 +634,12 @@ class MissionService:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
         assert profile and adapter
-        telemetry = await self._telemetry(run)
+        telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
         approach = approach_point(
             telemetry.position, target, zone.search_altitude_m, plan.safety.min_standoff_m
         )
         approach = approach.model_copy(update={"z": home.z - abs(zone.search_altitude_m)})
         validate_position(self._to_home(approach, home), zone, plan.safety)
-        lidar = await adapter.request(
-            "lidar_min", timeout=4, vehicle_name=profile.vehicle_name, sensor_name="LidarSensor1"
-        )
-        minimum = lidar.get("minimum_m")
-        if minimum is not None and minimum < plan.safety.min_clearance_m:
-            raise SafetyViolation("lidar clearance is below the configured minimum")
         run = await self._set_state(run, RunState.APPROACHING, target_position=target)
         await self._move_segmented(
             run,
@@ -660,26 +669,26 @@ class MissionService:
         return decision == "accept"
 
     async def _return_and_land(
-        self, run: RunRecord, vehicle_name: str, home: Vec3
+        self,
+        run: RunRecord,
+        plan: MissionPlan,
+        zone: SearchZone,
+        vehicle_name: str,
+        home: Vec3,
+        control: RunControl,
     ) -> RunRecord:
         adapter = self.simulator.adapter
         assert adapter
-        telemetry = await self._telemetry(run)
+        telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
         run = await self._set_state(run, RunState.RTH)
-        await adapter.request(
-            "move_to",
-            vehicle_name=vehicle_name,
-            x=home.x,
-            y=home.y,
-            z=telemetry.position.z,
-            speed=2,
-            timeout=60,
-        )
-        await self._wait_position(
+        await self._move_segmented(
             run,
+            plan,
+            zone,
             Vec3(x=home.x, y=home.y, z=telemetry.position.z),
-            RunControl(),
-            timeout=60,
+            home,
+            control,
+            speed=min(2.0, plan.safety.max_speed_mps),
         )
         run = await self._set_state(run, RunState.LANDING)
         await adapter.request("land", vehicle_name=vehicle_name, timeout=60)
@@ -703,22 +712,96 @@ class MissionService:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
         assert profile and adapter
-        telemetry = await self._telemetry(run)
-        start = telemetry.position
-        total = distance(start, target)
-        # Segments must remain longer than SimpleFlight's automatic lookahead;
-        # ~2 m commands at 3 m/s may resolve immediately without moving.
-        # Four metres is still a short, bounded command while clearing that
-        # dead zone reliably in UE4.27/AirSim 1.8.1.
-        segments = max(1, math.ceil(total / 4.0))
-        for index in range(1, segments + 1):
-            await self._handle_control(run, control)
-            ratio = index / segments
-            point = Vec3(
-                x=start.x + (target.x - start.x) * ratio,
-                y=start.y + (target.y - start.y) * ratio,
-                z=start.z + (target.z - start.z) * ratio,
+        telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
+        total = distance(telemetry.position, target)
+        segment_m = plan.safety.avoidance_segment_m
+        max_commands = (
+            max(1, math.ceil(total / segment_m))
+            + plan.safety.avoidance_max_replans
+            + 4
+        )
+        replans = 0
+        preferred_side: int | None = None
+        for _ in range(max_commands):
+            directive = await self._handle_control(run, control)
+            if directive == "return_home":
+                return
+            current = telemetry.position
+            remaining = distance(current, target)
+            if remaining <= 1.5:
+                return
+            ratio = min(1.0, segment_m / remaining)
+            direct = Vec3(
+                x=current.x + (target.x - current.x) * ratio,
+                y=current.y + (target.y - current.y) * ratio,
+                z=current.z + (target.z - current.z) * ratio,
             )
+            direct_allowed = self._segment_is_allowed(
+                current, direct, home, zone, plan
+            )
+            points = []
+            assessment = None
+            if plan.safety.obstacle_avoidance_enabled:
+                points = await self._lidar_points(run, profile.vehicle_name)
+                assessment = assess_corridor(
+                    current,
+                    direct,
+                    points,
+                    plan.safety.min_clearance_m,
+                )
+            blocked = not direct_allowed or bool(assessment and assessment.blocked)
+            await self._event(
+                "avoidance.scan",
+                {
+                    "from": current.model_dump(),
+                    "to": direct.model_dump(),
+                    "point_count": len(points),
+                    "minimum_clearance_m": (
+                        assessment.minimum_clearance_m if assessment else None
+                    ),
+                    "required_clearance_m": plan.safety.min_clearance_m,
+                    "blocked": blocked,
+                    "geofence_clear": direct_allowed,
+                },
+                run.id,
+            )
+            point = direct
+            if blocked:
+                replans += 1
+                if replans > plan.safety.avoidance_max_replans:
+                    raise SafetyViolation(
+                        "local obstacle avoidance exceeded its replan limit"
+                    )
+                detour = choose_local_detour(
+                    current,
+                    target,
+                    points,
+                    plan.safety.min_clearance_m,
+                    segment_m,
+                    lambda start, end: self._segment_is_allowed(
+                        start, end, home, zone, plan
+                    ),
+                    preferred_side,
+                )
+                if detour is None:
+                    raise SafetyViolation(
+                        "LiDAR found an occupied flight corridor and no safe local detour"
+                    )
+                point = detour.waypoint
+                preferred_side = detour.side
+                await self._event(
+                    "avoidance.detour",
+                    {
+                        "blocked_target": direct.model_dump(),
+                        "waypoint": point.model_dump(),
+                        "side": "right" if detour.side > 0 else "left",
+                        "angle_degrees": detour.angle_degrees,
+                        "observed_clearance_m": detour.minimum_clearance_m,
+                        "replan": replans,
+                        "message": "航段被障碍占用，执行短距离局部绕行并在下一段重新扫描",
+                    },
+                    run.id,
+                )
             validate_position(self._to_home(point, home), zone, plan.safety)
             arguments: dict[str, float | str] = {
                 "vehicle_name": profile.vehicle_name,
@@ -727,11 +810,11 @@ class MissionService:
                 "z": point.z,
                 "speed": min(speed or plan.safety.max_speed_mps, plan.safety.max_speed_mps),
             }
-            if look_at is not None:
-                dx = look_at.x - telemetry.position.x
-                dy = look_at.y - telemetry.position.y
-                if math.hypot(dx, dy) > 1e-6:
-                    arguments["yaw_degrees"] = math.degrees(math.atan2(dy, dx))
+            heading_target = look_at or point
+            dx = heading_target.x - current.x
+            dy = heading_target.y - current.y
+            if math.hypot(dx, dy) > 1e-6:
+                arguments["yaw_degrees"] = math.degrees(math.atan2(dy, dx))
             await adapter.request(
                 "move_to",
                 timeout=20,
@@ -742,8 +825,63 @@ class MissionService:
             # segments use a matching acceptance radius; every telemetry
             # sample is still checked against the full safety envelope.
             telemetry = await self._wait_position(
-                run, point, control, timeout=20, tolerance=1.5
+                run,
+                point,
+                control,
+                timeout=20,
+                tolerance=1.5,
+                plan=plan,
+                zone=zone,
+                home=home,
             )
+        raise SafetyViolation("local obstacle avoidance did not converge on the destination")
+
+    async def _lidar_points(self, run: RunRecord, vehicle_name: str) -> list[Vec3]:
+        adapter = self.simulator.adapter
+        assert adapter
+        for attempt in range(1, 4):
+            scan = await adapter.request(
+                "lidar_scan",
+                timeout=4,
+                vehicle_name=vehicle_name,
+                sensor_name="LidarSensor1",
+                max_points=6000,
+            )
+            if scan.get("data_frame") != "VehicleInertialFrame":
+                raise SafetyViolation("LiDAR scan is not in the required world NED frame")
+            points = decode_point_cloud(scan.get("point_cloud", []))
+            if points:
+                return points
+            await self._event(
+                "avoidance.sensor_wait",
+                {"sensor": "LidarSensor1", "attempt": attempt},
+                run.id,
+            )
+            await asyncio.sleep(0.2)
+        raise SafetyViolation("LiDAR returned no usable obstacle points")
+
+    def _segment_is_allowed(
+        self,
+        start: Vec3,
+        end: Vec3,
+        home: Vec3,
+        zone: SearchZone,
+        plan: MissionPlan,
+    ) -> bool:
+        segment_length = distance(start, end)
+        samples = max(1, math.ceil(segment_length / 0.5))
+        try:
+            for index in range(samples + 1):
+                ratio = index / samples
+                point = Vec3(
+                    x=start.x + (end.x - start.x) * ratio,
+                    y=start.y + (end.y - start.y) * ratio,
+                    z=start.z + (end.z - start.z) * ratio,
+                )
+                validate_position(self._to_home(point, home), zone, plan.safety)
+        except SafetyViolation:
+            return False
+        return True
 
     async def _climb_to_search_altitude(
         self,
@@ -814,11 +952,14 @@ class MissionService:
         control: RunControl,
         timeout: float,
         tolerance: float = 0.75,
+        plan: MissionPlan | None = None,
+        zone: SearchZone | None = None,
+        home: Vec3 | None = None,
     ) -> Telemetry:
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             await self._handle_control(run, control)
-            telemetry = await self._telemetry(run)
+            telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
             if distance(telemetry.position, target) <= tolerance:
                 return telemetry
             await asyncio.sleep(0.2)
@@ -900,7 +1041,14 @@ class MissionService:
             await asyncio.sleep(0.2)
         raise MissionError("landing did not complete before timeout")
 
-    async def _telemetry(self, run: RunRecord) -> Telemetry:
+    async def _telemetry(
+        self,
+        run: RunRecord,
+        *,
+        plan: MissionPlan | None = None,
+        zone: SearchZone | None = None,
+        home: Vec3 | None = None,
+    ) -> Telemetry:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
         if not profile or not adapter:
@@ -910,6 +1058,8 @@ class MissionService:
         age = (utc_now() - telemetry.timestamp).total_seconds()
         if age > profile.safety.telemetry_stale_seconds:
             raise SafetyViolation(f"telemetry is stale by {age:.2f} seconds")
+        if plan is not None and zone is not None and home is not None:
+            validate_position(self._to_home(telemetry.position, home), zone, plan.safety)
         self.store.append_jsonl(
             Path(run.artifact_dir) / "telemetry.jsonl", telemetry.model_dump(mode="json")
         )

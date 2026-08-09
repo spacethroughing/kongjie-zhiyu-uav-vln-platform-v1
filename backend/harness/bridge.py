@@ -229,6 +229,13 @@ class MockVehicleAdapter(VehicleAdapter):
             }
         if operation == "lidar_min":
             return {"minimum_m": 20.0, "point_count": 10}
+        if operation == "lidar_scan":
+            return {
+                "point_cloud": [100.0, 100.0, -5.0],
+                "point_count": 1,
+                "sampled_point_count": 1,
+                "data_frame": "VehicleInertialFrame",
+            }
         if operation == "reset":
             self.position = Vec3(x=0, y=0, z=0)
             self.armed = False

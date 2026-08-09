@@ -165,6 +165,18 @@ class SimulatorManager:
                         "height": frame.height,
                     },
                 )
+                phase = "LiDAR scan"
+                lidar = await self.adapter.request(
+                    "lidar_scan",
+                    timeout=5,
+                    vehicle_name=vehicle_name,
+                    sensor_name="LidarSensor1",
+                    max_points=1000,
+                )
+                if lidar.get("data_frame") != "VehicleInertialFrame":
+                    raise SimulatorError("LiDAR is not using the required world NED frame")
+                if int(lidar.get("sampled_point_count", 0)) <= 0:
+                    raise SimulatorError("LiDAR returned no obstacle points")
                 phase = "landing"
                 await self.adapter.request("land", timeout=5, vehicle_name=vehicle_name)
                 landed = await self._wait_vehicle(
@@ -185,6 +197,11 @@ class SimulatorManager:
                     "ok": True,
                     "scene_id": profile.id,
                     "frame": {"width": frame.width, "height": frame.height, "frame_id": frame.frame_id},
+                    "lidar": {
+                        "data_frame": lidar["data_frame"],
+                        "point_count": int(lidar.get("point_count", 0)),
+                        "sampled_point_count": int(lidar.get("sampled_point_count", 0)),
+                    },
                     "ground_contact": landed.landed
                     or abs(landed.position.z - ground_z) <= 0.25,
                     "telemetry": final.model_dump(mode="json"),

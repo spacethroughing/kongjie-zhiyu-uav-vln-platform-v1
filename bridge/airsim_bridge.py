@@ -259,11 +259,37 @@ class Bridge(object):
             data = client.getLidarData(sensor, vehicle)
             points = data.point_cloud
             minimum = None
+            origin = data.pose.position
             for index in range(0, len(points), 3):
-                distance = math.sqrt(points[index] ** 2 + points[index + 1] ** 2 + points[index + 2] ** 2)
+                distance = math.sqrt(
+                    (points[index] - origin.x_val) ** 2
+                    + (points[index + 1] - origin.y_val) ** 2
+                    + (points[index + 2] - origin.z_val) ** 2
+                )
                 if distance > 0 and (minimum is None or distance < minimum):
                     minimum = distance
             return {"minimum_m": minimum, "point_count": len(points) // 3}
+        if operation == "lidar_scan":
+            sensor = arguments.get("sensor_name", "LidarSensor1")
+            max_points = max(100, int(arguments.get("max_points", 6000)))
+            data = client.getLidarData(sensor, vehicle)
+            points = data.point_cloud
+            point_count = len(points) // 3
+            stride = max(1, int(math.ceil(float(point_count) / max_points)))
+            sampled = []
+            for index in range(0, len(points) - 2, 3 * stride):
+                sampled.extend(
+                    [float(points[index]), float(points[index + 1]), float(points[index + 2])]
+                )
+            return {
+                "point_cloud": sampled,
+                "point_count": point_count,
+                "sampled_point_count": len(sampled) // 3,
+                "timestamp_ns": int(data.time_stamp),
+                "pose": self._vec(data.pose.position),
+                "orientation": self._quat(data.pose.orientation),
+                "data_frame": "VehicleInertialFrame",
+            }
         if operation == "reset":
             client.reset()
             return {"accepted": True}

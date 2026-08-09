@@ -25,6 +25,8 @@ def test_health_and_plan_require_ready_simulator(monkeypatch, tmp_path):
         smoke = client.post("/api/simulator/smoke")
         assert smoke.status_code == 200
         assert smoke.json()["frame"]["width"] == 64
+        assert smoke.json()["lidar"]["data_frame"] == "VehicleInertialFrame"
+        assert smoke.json()["lidar"]["sampled_point_count"] > 0
         assert smoke.json()["telemetry"]["landed"] is True
         plan = client.post(
             "/api/missions/plan",

@@ -98,6 +98,36 @@ class CollisionAdapter(MockVehicleAdapter):
         return payload
 
 
+class EnclosedLidarAdapter(MockVehicleAdapter):
+    async def request(self, operation: str, **arguments):
+        if operation == "lidar_scan":
+            points = []
+            for index in range(36):
+                angle = index * math.tau / 36
+                points.extend(
+                    [
+                        self.position.x + math.cos(angle) * 0.5,
+                        self.position.y + math.sin(angle) * 0.5,
+                        self.position.z,
+                    ]
+                )
+            return {
+                "point_cloud": points,
+                "point_count": 36,
+                "sampled_point_count": 36,
+                "data_frame": "VehicleInertialFrame",
+            }
+        return await super().request(operation, **arguments)
+
+
+class GeofenceDriftAdapter(MockVehicleAdapter):
+    async def request(self, operation: str, **arguments):
+        payload = await super().request(operation, **arguments)
+        if operation == "move_to" and float(arguments.get("speed", 0)) >= 3:
+            self.position = self.position.model_copy(update={"x": 31.0})
+        return payload
+
+
 class LowTakeoffAdapter(MockVehicleAdapter):
     async def request(self, operation: str, **arguments):
         if operation == "takeoff":
@@ -241,6 +271,22 @@ async def test_collision_enters_safe_hold(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_occupied_lidar_corridor_fails_closed_without_a_detour(tmp_path: Path):
+    current, states = await run_case(tmp_path, MockProvider(), EnclosedLidarAdapter())
+    assert current.state == RunState.FAILED
+    assert "no safe local detour" in (current.error or "")
+    assert RunState.SAFE_HOLD.value in states
+
+
+@pytest.mark.asyncio
+async def test_actual_position_drift_outside_geofence_enters_safe_hold(tmp_path: Path):
+    current, states = await run_case(tmp_path, MockProvider(), GeofenceDriftAdapter())
+    assert current.state == RunState.FAILED
+    assert "outside the configured search geofence" in (current.error or "")
+    assert RunState.SAFE_HOLD.value in states
+
+
+@pytest.mark.asyncio
 async def test_low_takeoff_climbs_vertically_before_search(tmp_path: Path):
     current, states = await run_case(tmp_path, MockProvider(), LowTakeoffAdapter())
     assert current.state == RunState.SUCCEEDED, current.error
@@ -262,7 +308,11 @@ async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_pa
     assert RunState.VERIFYING.value in states
     assert current.target_position is not None
     assert adapter.target_heading_moves
-    for move in adapter.target_heading_moves:
+    approach_moves = [
+        move for move in adapter.target_heading_moves if float(move["speed"]) == 4.0
+    ]
+    assert approach_moves
+    for move in approach_moves:
         expected_yaw = math.degrees(
             math.atan2(
                 current.target_position.y - move["origin"]["y"],
@@ -271,7 +321,7 @@ async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_pa
         )
         angular_error = abs((move["yaw_degrees"] - expected_yaw + 180) % 360 - 180)
         assert angular_error < 1e-6
-    final_move = adapter.target_heading_moves[-1]
+    final_move = approach_moves[-1]
     assert math.hypot(
         final_move["x"] - current.target_position.x,
         final_move["y"] - current.target_position.y,

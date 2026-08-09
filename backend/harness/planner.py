@@ -113,6 +113,7 @@ def build_plan(profile: SceneProfile, request: SearchMissionRequest) -> MissionP
             f"接近距离不少于 {profile.safety.min_standoff_m:.1f} m",
             f"任务时限 {profile.safety.max_mission_seconds} s",
             range_summary,
+            f"LiDAR 航段避障，最小净空 {profile.safety.min_clearance_m:.1f} m",
             "目标居中并通过深度复核后才允许接近",
         ],
     )

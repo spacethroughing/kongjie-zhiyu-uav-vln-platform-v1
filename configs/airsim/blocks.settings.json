@@ -25,15 +25,14 @@
           "RotationsPerSecond": 10,
           "PointsPerSecond": 20000,
           "Range": 25,
-          "HorizontalFOVStart": -90,
-          "HorizontalFOVEnd": 90,
+          "HorizontalFOVStart": -180,
+          "HorizontalFOVEnd": 180,
           "VerticalFOVUpper": 10,
           "VerticalFOVLower": -20,
           "DrawDebugPoints": false,
-          "DataFrame": "SensorLocalFrame"
+          "DataFrame": "VehicleInertialFrame"
         }
       }
     }
   }
 }
-

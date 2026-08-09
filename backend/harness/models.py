@@ -103,9 +103,35 @@ class SafetyEnvelope(BaseModel):
     approach_speed_mps: float = 1.0
     min_standoff_m: float = 3.0
     min_clearance_m: float = 1.5
+    obstacle_avoidance_enabled: bool = True
+    avoidance_segment_m: float = 4.0
+    avoidance_max_replans: int = 12
     max_mission_seconds: int = 900
     telemetry_stale_seconds: float = 1.5
     no_fly_zones: list[Polygon] = Field(default_factory=list)
+
+    @field_validator(
+        "min_altitude_m",
+        "max_altitude_m",
+        "max_speed_mps",
+        "approach_speed_mps",
+        "min_standoff_m",
+        "min_clearance_m",
+        "avoidance_segment_m",
+        "telemetry_stale_seconds",
+    )
+    @classmethod
+    def positive_safety_value(cls, value: float) -> float:
+        if value <= 0 or not math.isfinite(value):
+            raise ValueError("safety values must be finite and positive")
+        return value
+
+    @field_validator("avoidance_max_replans", "max_mission_seconds")
+    @classmethod
+    def positive_safety_count(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("safety counts must be positive")
+        return value
 
 
 class SearchZone(BaseModel):
