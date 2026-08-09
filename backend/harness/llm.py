@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -108,17 +109,35 @@ class OpenAICompatibleProvider(ModelProvider):
             # the provider's native JSON mode to avoid truncated/empty content.
             body["thinking"] = {"type": "disabled"}
             body["response_format"] = {"type": "json_object"}
-        response = await self._client.post(
-            f"{self.base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-            json=body,
-        )
-        response.raise_for_status()
+        response = await self._post_with_rate_limit_backoff(body)
         payload = response.json()
         content = payload["choices"][0]["message"]["content"]
         parsed = _extract_json(content)
         parsed["frame_id"] = frame.frame_id
         return DetectionAssessment.model_validate(parsed)
+
+    async def _post_with_rate_limit_backoff(self, body: dict[str, Any]):
+        """Retry transient provider throttling without creating VLM call bursts."""
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        for attempt in range(4):
+            response = await self._client.post(url, headers=headers, json=body)
+            try:
+                response.raise_for_status()
+                return response
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code != 429 or attempt == 3:
+                    raise
+                retry_after = error.response.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else 2**(attempt + 1)
+                except ValueError:
+                    delay = 2**(attempt + 1)
+                await asyncio.sleep(max(0.25, min(delay, 15.0)))
+        raise RuntimeError("unreachable model retry state")
 
     async def probe(self) -> dict[str, Any]:
         if self._probe_result:
