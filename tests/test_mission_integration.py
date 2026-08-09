@@ -86,6 +86,15 @@ class InconsistentCenteredProvider(ModelProvider):
         )
 
 
+class RecordingMockProvider(MockProvider):
+    def __init__(self):
+        self.observations = []
+
+    async def inspect(self, frame, target_text, telemetry, observation_index):
+        self.observations.append(observation_index)
+        return await super().inspect(frame, target_text, telemetry, observation_index)
+
+
 class NoDepthAdapter(MockVehicleAdapter):
     async def request(self, operation: str, **arguments):
         payload = await super().request(operation, **arguments)
@@ -191,12 +200,21 @@ class HeadingRecordingAdapter(MockVehicleAdapter):
     def __init__(self):
         super().__init__()
         self.target_heading_moves = []
+        self.operations = []
 
     async def request(self, operation: str, **arguments):
+        self.operations.append({"operation": operation, **dict(arguments)})
         if operation == "move_to" and "yaw_degrees" in arguments:
             self.target_heading_moves.append(
                 {"origin": self.position.model_dump(), **dict(arguments)}
             )
+        return await super().request(operation, **arguments)
+
+
+class SlowMoveAdapter(HeadingRecordingAdapter):
+    async def request(self, operation: str, **arguments):
+        if operation == "move_to":
+            await asyncio.sleep(0.05)
         return await super().request(operation, **arguments)
 
 
@@ -330,6 +348,19 @@ async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_pa
         final_move["x"] - current.target_position.x,
         final_move["y"] - current.target_position.y,
     ) == pytest.approx(3.0)
+    approach_operation_indexes = [
+        index
+        for index, operation in enumerate(adapter.operations)
+        if operation["operation"] == "move_to"
+        and float(operation["speed"]) == 4.0
+    ]
+    hover_indexes = [
+        index
+        for index, operation in enumerate(adapter.operations)
+        if operation["operation"] == "hover"
+    ]
+    assert hover_indexes
+    assert min(hover_indexes) > max(approach_operation_indexes)
     events = [
         json.loads(line)
         for line in (Path(current.artifact_dir) / "events.jsonl")
@@ -345,14 +376,29 @@ async def test_initial_panorama_locks_then_approaches_with_target_heading(tmp_pa
 
 @pytest.mark.asyncio
 async def test_single_frame_lock_skips_centering_and_second_depth_check(tmp_path: Path):
-    provider = InconsistentCenteredProvider()
+    provider = RecordingMockProvider()
     current, states = await run_case(tmp_path, provider, panorama=True)
     assert current.state == RunState.SUCCEEDED, current.error
     assert RunState.APPROACHING.value in states
-    assert provider.observations == [1, 2]
+    assert len(provider.observations) >= 3
+    assert provider.observations == list(range(1, len(provider.observations) + 1))
     events = (Path(current.artifact_dir) / "events.jsonl").read_text(encoding="utf-8")
     assert "locked_centering" not in events
     assert '"mode":"single_frame_depth"' in events
+    assert "guidance.target_updated" in events
+
+
+@pytest.mark.asyncio
+async def test_continuous_guidance_fails_closed_after_three_lost_frames(tmp_path: Path):
+    provider = InconsistentCenteredProvider()
+    current, states = await run_case(
+        tmp_path, provider, adapter=SlowMoveAdapter(), panorama=True
+    )
+    assert current.state == RunState.FAILED
+    assert "VLM guidance lost the target" in (current.error or "")
+    assert RunState.SAFE_HOLD.value in states
+    assert provider.observations[:2] == [1, 2]
+    assert len(provider.observations) >= 5
 
 
 @pytest.mark.asyncio

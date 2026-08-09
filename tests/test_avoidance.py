@@ -66,6 +66,21 @@ def test_local_detour_fails_closed_when_every_exit_is_occupied():
     )
 
 
+def test_local_detour_cost_preserves_heading_continuity_across_replans():
+    detour = choose_local_detour(
+        Vec3(x=0, y=0, z=-5),
+        Vec3(x=8, y=0, z=-5),
+        [],
+        required_clearance_m=1.5,
+        step_m=4,
+        is_segment_allowed=lambda _start, _end: True,
+        previous_heading_rad=math.radians(-40),
+    )
+    assert detour is not None
+    assert detour.side == -1
+    assert detour.angle_degrees == -40
+
+
 class StaticObstacleAdapter(MockVehicleAdapter):
     def __init__(self) -> None:
         super().__init__()

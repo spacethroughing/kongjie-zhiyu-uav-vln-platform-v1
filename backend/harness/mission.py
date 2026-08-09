@@ -7,6 +7,7 @@ import json
 import math
 import os
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -61,6 +62,21 @@ class RunControl:
     candidate_decision: asyncio.Queue[str] = field(default_factory=lambda: asyncio.Queue(maxsize=1))
     home_position: Vec3 | None = None
     deadline_monotonic: float | None = None
+
+
+@dataclass
+class VlmGuidanceState:
+    target: Vec3
+    observation_index: int
+    consecutive_failures: int = 0
+    update_count: int = 0
+    fatal_error: str | None = None
+
+
+@dataclass
+class LocalPlannerState:
+    preferred_side: int | None = None
+    last_heading_rad: float | None = None
 
 
 class MissionService:
@@ -233,12 +249,12 @@ class MissionService:
                 observation_index,
             )
             if confirmed:
-                accepted = await self._approach_and_review(
-                    run, plan, zone, confirmed, home, control
+                accepted, observation_index = await self._approach_and_review(
+                    run, plan, zone, confirmed, home, control, observation_index
                 )
                 if accepted:
                     found = True
-                else:
+                elif not control.return_home.is_set():
                     run = self.store.get_run(run.id) or run
                     run = await self._set_state(run, RunState.SEARCHING)
 
@@ -279,14 +295,21 @@ class MissionService:
                         run, plan, zone, frame, telemetry, assessment, home
                     )
                     if confirmed:
-                        accepted = await self._approach_and_review(
-                            run, plan, zone, confirmed, home, control
+                        accepted, observation_index = await self._approach_and_review(
+                            run,
+                            plan,
+                            zone,
+                            confirmed,
+                            home,
+                            control,
+                            observation_index,
                         )
                         if accepted:
                             found = True
                             break
-                        run = self.store.get_run(run.id) or run
-                        run = await self._set_state(run, RunState.SEARCHING)
+                        if not control.return_home.is_set():
+                            run = self.store.get_run(run.id) or run
+                            run = await self._set_state(run, RunState.SEARCHING)
                 if found or control.return_home.is_set() or control.land.is_set():
                     break
 
@@ -503,33 +526,115 @@ class MissionService:
         target: Vec3,
         home: Vec3,
         control: RunControl,
-    ) -> bool:
+        observation_index: int,
+    ) -> tuple[bool, int]:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
         assert profile and adapter
-        telemetry = await self._telemetry(run, plan=plan, zone=zone, home=home)
-        approach = approach_point(
-            telemetry.position, target, zone.search_altitude_m, plan.safety.min_standoff_m
-        )
-        approach = approach.model_copy(update={"z": home.z - abs(zone.search_altitude_m)})
-        validate_position(self._to_home(approach, home), zone, plan.safety)
         run = await self._set_state(run, RunState.APPROACHING, target_position=target)
-        await self._move_segmented(
-            run,
-            plan,
-            zone,
-            approach,
-            home,
-            control,
-            speed=plan.safety.approach_speed_mps,
-            look_at=target,
+        guidance = VlmGuidanceState(target=target, observation_index=observation_index)
+        stop_guidance = asyncio.Event()
+        guidance_task = asyncio.create_task(
+            self._stream_vlm_guidance(
+                run, plan, zone, home, guidance, stop_guidance
+            ),
+            name=f"vlm-guidance-{run.id}",
         )
+        planner_state = LocalPlannerState()
+        reached_standoff = False
+        max_action_chunks = 24
+        try:
+            # Let capture/model inference begin before the first motion chunk.
+            await asyncio.sleep(0)
+            for chunk_index in range(1, max_action_chunks + 1):
+                directive = await self._handle_control(run, control)
+                if directive == "return_home":
+                    return False, guidance.observation_index
+                if guidance.fatal_error:
+                    raise SafetyViolation(guidance.fatal_error)
+                telemetry = await self._telemetry(
+                    run, plan=plan, zone=zone, home=home
+                )
+                # Snapshot the current ensemble. A committed action chunk is
+                # never redirected mid-flight by a late/noisy VLM response.
+                chunk_target = guidance.target
+                approach = approach_point(
+                    telemetry.position,
+                    chunk_target,
+                    zone.search_altitude_m,
+                    plan.safety.min_standoff_m,
+                ).model_copy(update={"z": home.z - abs(zone.search_altitude_m)})
+                validate_position(self._to_home(approach, home), zone, plan.safety)
+                remaining = distance(telemetry.position, approach)
+                if remaining <= 1.5:
+                    reached_standoff = True
+                    break
+                chunk_m = min(3.0, plan.safety.avoidance_segment_m)
+                ratio = min(1.0, chunk_m / remaining)
+                waypoint = Vec3(
+                    x=telemetry.position.x + (approach.x - telemetry.position.x) * ratio,
+                    y=telemetry.position.y + (approach.y - telemetry.position.y) * ratio,
+                    z=telemetry.position.z + (approach.z - telemetry.position.z) * ratio,
+                )
+                await self._event(
+                    "action_chunk.committed",
+                    {
+                        "chunk": chunk_index,
+                        "target_generation": guidance.update_count,
+                        "target": chunk_target.model_dump(),
+                        "waypoint": waypoint.model_dump(),
+                        "length_limit_m": chunk_m,
+                        "remaining_to_standoff_m": remaining,
+                        "message": "提交短时动作块；飞行中 VLM 与 LiDAR 继续更新下一段",
+                    },
+                    run.id,
+                )
+                await self._move_segmented(
+                    run,
+                    plan,
+                    zone,
+                    waypoint,
+                    home,
+                    control,
+                    speed=plan.safety.approach_speed_mps,
+                    look_at=chunk_target,
+                    planner_state=planner_state,
+                )
+                await self._event(
+                    "action_chunk.completed",
+                    {
+                        "chunk": chunk_index,
+                        "latest_target_generation": guidance.update_count,
+                        "message": "动作块完成，立即用最新目标和局部障碍重规划",
+                    },
+                    run.id,
+                )
+                # Fair scheduling for the mock provider; real VLM latency also
+                # naturally yields while the vehicle keeps moving.
+                await asyncio.sleep(0)
+            if not reached_standoff:
+                raise SafetyViolation(
+                    "continuous VLM action chunks did not converge to the standoff point"
+                )
+        finally:
+            stop_guidance.set()
+            guidance_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await guidance_task
+        if guidance.fatal_error:
+            raise SafetyViolation(guidance.fatal_error)
+        observation_index = guidance.observation_index
+        current_target = guidance.target
+        # Hover is reserved for final evidence (and explicit safety/manual
+        # controls), never inserted between guidance chunks.
         await adapter.request("hover", timeout=4, vehicle_name=profile.vehicle_name)
         evidence = await adapter.capture(profile.vehicle_name)
         self._save_frame(run, evidence, evidence=True)
-        run = await self._set_state(run, RunState.EVIDENCE, target_position=target)
+        run = await self._set_state(
+            run, RunState.EVIDENCE, target_position=current_target
+        )
         if plan.request.end_policy == "auto_rth":
-            return True
+            return True, observation_index
         await self._event(
             "candidate.review",
             {"timeout_seconds": 30, "default": "accept", "frame_id": evidence.frame_id},
@@ -539,7 +644,122 @@ class MissionService:
             decision = await asyncio.wait_for(control.candidate_decision.get(), timeout=30)
         except asyncio.TimeoutError:
             decision = "accept"
-        return decision == "accept"
+        return decision == "accept", observation_index
+
+    async def _stream_vlm_guidance(
+        self,
+        run: RunRecord,
+        plan: MissionPlan,
+        zone: SearchZone,
+        home: Vec3,
+        state: VlmGuidanceState,
+        stop_event: asyncio.Event,
+    ) -> None:
+        profile = self.simulator.active_profile
+        assert profile
+        await self._event(
+            "guidance.stream_started",
+            {
+                "mode": "continuous_in_flight",
+                "message": "VLM 后台连续引导已启动，不为识别插入悬停",
+            },
+            run.id,
+        )
+        try:
+            while not stop_event.is_set():
+                state.observation_index += 1
+                try:
+                    frame, telemetry, assessment = await self._capture_assessment(
+                        run, plan, zone, home, state.observation_index
+                    )
+                    observed_target = await self._evaluate_candidate(
+                        run, plan, zone, frame, telemetry, assessment, home
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    observed_target = None
+                    await self._event(
+                        "guidance.model_error",
+                        {
+                            "observation_index": state.observation_index,
+                            "error": f"{type(error).__name__}: {error}",
+                        },
+                        run.id,
+                    )
+                if observed_target is None:
+                    state.consecutive_failures += 1
+                    await self._event(
+                        "guidance.target_lost",
+                        {
+                            "observation_index": state.observation_index,
+                            "consecutive_misses": state.consecutive_failures,
+                            "message": "当前帧未得到可靠目标；保持当前动作块并后台复查",
+                        },
+                        run.id,
+                    )
+                else:
+                    update_distance = distance(state.target, observed_target)
+                    distance_to_target = distance(telemetry.position, state.target)
+                    allowed_update = max(
+                        3.0, min(10.0, distance_to_target * 0.25)
+                    )
+                    if update_distance > allowed_update:
+                        state.consecutive_failures += 1
+                        await self._event(
+                            "guidance.update_rejected",
+                            {
+                                "observation_index": state.observation_index,
+                                "previous_target": state.target.model_dump(),
+                                "observed_target": observed_target.model_dump(),
+                                "update_distance_m": update_distance,
+                                "allowed_update_m": allowed_update,
+                                "consecutive_misses": state.consecutive_failures,
+                                "message": "VLM 坐标跳变过大；不打断当前动作块",
+                            },
+                            run.id,
+                        )
+                    else:
+                        # Temporal ensemble: keep most of the prior estimate so
+                        # frame-to-frame box/depth noise cannot jerk the heading.
+                        alpha = 0.35
+                        state.target = Vec3(
+                            x=state.target.x * (1 - alpha) + observed_target.x * alpha,
+                            y=state.target.y * (1 - alpha) + observed_target.y * alpha,
+                            z=state.target.z * (1 - alpha) + observed_target.z * alpha,
+                        )
+                        state.consecutive_failures = 0
+                        state.update_count += 1
+                        await self._event(
+                            "guidance.target_updated",
+                            {
+                                "observation_index": state.observation_index,
+                                "target_generation": state.update_count,
+                                "target": state.target.model_dump(),
+                                "raw_update_distance_m": update_distance,
+                                "smoothing_alpha": alpha,
+                                "message": "最新 VLM 结果已平滑写入下一动作块",
+                            },
+                            run.id,
+                        )
+                if state.consecutive_failures >= 3:
+                    state.fatal_error = (
+                        "VLM guidance lost the target or produced unsafe "
+                        "coordinate jumps three times"
+                    )
+                    await self._event(
+                        "guidance.stream_failed",
+                        {"reason": state.fatal_error},
+                        run.id,
+                    )
+                    return
+                await asyncio.sleep(0)
+        finally:
+            await self._event(
+                "guidance.stream_stopped",
+                {"updates": state.update_count},
+                run.id,
+            )
 
     async def _return_and_land(
         self,
@@ -581,6 +801,7 @@ class MissionService:
         control: RunControl,
         speed: float | None = None,
         look_at: Vec3 | None = None,
+        planner_state: LocalPlannerState | None = None,
     ) -> None:
         profile = self.simulator.active_profile
         adapter = self.simulator.adapter
@@ -594,7 +815,7 @@ class MissionService:
             + 4
         )
         replans = 0
-        preferred_side: int | None = None
+        planner_state = planner_state or LocalPlannerState()
         for _ in range(max_commands):
             directive = await self._handle_control(run, control)
             if directive == "return_home":
@@ -654,14 +875,15 @@ class MissionService:
                     lambda start, end: self._segment_is_allowed(
                         start, end, home, zone, plan
                     ),
-                    preferred_side,
+                    planner_state.preferred_side,
+                    planner_state.last_heading_rad,
                 )
                 if detour is None:
                     raise SafetyViolation(
                         "LiDAR found an occupied flight corridor and no safe local detour"
                     )
                 point = detour.waypoint
-                preferred_side = detour.side
+                planner_state.preferred_side = detour.side
                 await self._event(
                     "avoidance.detour",
                     {
@@ -671,7 +893,13 @@ class MissionService:
                         "angle_degrees": detour.angle_degrees,
                         "observed_clearance_m": detour.minimum_clearance_m,
                         "replan": replans,
-                        "message": "航段被障碍占用，执行短距离局部绕行并在下一段重新扫描",
+                        "planner": "rolling_local_ego_inspired",
+                        "previous_heading_degrees": (
+                            math.degrees(planner_state.last_heading_rad)
+                            if planner_state.last_heading_rad is not None
+                            else None
+                        ),
+                        "message": "滚动局部规划发现阻塞；保持方向连续性绕行并在下一段重扫",
                     },
                     run.id,
                 )
@@ -688,6 +916,10 @@ class MissionService:
             dy = heading_target.y - current.y
             if math.hypot(dx, dy) > 1e-6:
                 arguments["yaw_degrees"] = math.degrees(math.atan2(dy, dx))
+            motion_dx = point.x - current.x
+            motion_dy = point.y - current.y
+            if math.hypot(motion_dx, motion_dy) > 1e-6:
+                planner_state.last_heading_rad = math.atan2(motion_dy, motion_dx)
             await adapter.request(
                 "move_to",
                 timeout=20,

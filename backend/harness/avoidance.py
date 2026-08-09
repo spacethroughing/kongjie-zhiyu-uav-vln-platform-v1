@@ -90,8 +90,14 @@ def choose_local_detour(
     step_m: float,
     is_segment_allowed: Callable[[Vec3, Vec3], bool],
     preferred_side: int | None = None,
+    previous_heading_rad: float | None = None,
 ) -> Detour | None:
-    """Choose a short collision-free sidestep; the caller rescans after it."""
+    """Choose a short collision-free sidestep; the caller rescans after it.
+
+    ``preferred_side`` and ``previous_heading_rad`` provide local-planner
+    hysteresis across rolling replans.  They prevent equally safe candidates
+    from alternating left/right or producing a sharp heading reversal.
+    """
     dx = goal.x - start.x
     dy = goal.y - start.y
     heading = math.atan2(dy, dx)
@@ -128,12 +134,21 @@ def choose_local_detour(
                 assessment.minimum_clearance_m or required_clearance_m * 2,
                 required_clearance_m * 3,
             )
+            heading_change = 0.0
+            if previous_heading_rad is not None:
+                heading_change = abs(
+                    (angle - previous_heading_rad + math.pi) % (2 * math.pi)
+                    - math.pi
+                )
             # Prefer forward progress, keep an established wall-following side,
-            # and use greater observed clearance as the tie breaker.
+            # retain heading continuity, and use greater observed clearance as
+            # the tie breaker. This is a lightweight rolling local-planner cost,
+            # not a global route replacement.
             score = (
                 remaining
                 + abs(angle_degrees) * 0.008
                 + side_rank * 0.35
+                + heading_change * 0.55
                 - clearance_bonus * 0.03
             )
             candidates.append(

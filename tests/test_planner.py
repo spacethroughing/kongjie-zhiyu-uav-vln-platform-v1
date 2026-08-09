@@ -39,7 +39,7 @@ def test_plan_contains_immutable_safety_summary():
     )
     assert plan.version == 1
     assert plan.route
-    assert any("单帧 VLM" in line for line in plan.safety_summary)
+    assert any("VLM 后台连续更新" in line for line in plan.safety_summary)
 
 
 def test_coverage_polygon_can_be_smaller_than_target_geofence():

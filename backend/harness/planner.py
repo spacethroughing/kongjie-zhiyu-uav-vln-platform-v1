@@ -114,6 +114,6 @@ def build_plan(profile: SceneProfile, request: SearchMissionRequest) -> MissionP
             f"任务时限 {profile.safety.max_mission_seconds} s",
             range_summary,
             f"LiDAR 航段避障，最小净空 {profile.safety.min_clearance_m:.1f} m",
-            "单帧 VLM 匹配并取得有效初始深度坐标后立即接近",
+            "接近采用滚动 Action Chunk；VLM 后台连续更新，LiDAR 在段间实时重规划",
         ],
     )
