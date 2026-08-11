@@ -7,8 +7,17 @@
 > 当前版本：`v0.1.0` / “空界智语——无人机视觉语言导航 v1”
 > 当前定位：可运行的研究原型与自动化 harness，不应直接用于真机或安全关键场景。
 
+## 项目预览
+
+<p align="center">
+  <img src="docs/images/web-console-v1.png" alt="空界智语无人机视觉语言导航平台 Web 控制台" width="100%">
+</p>
+
+<p align="center"><em>三栏 Web 控制台：VLM 配置、任务审核、RGB/深度、数字孪生、实时点云、语义拓扑与安全控制。</em></p>
+
 ## 目录
 
+- [项目预览](#项目预览)
 - [核心能力](#核心能力)
 - [设计边界](#设计边界)
 - [系统要求](#系统要求)
@@ -467,6 +476,14 @@ AirSim 使用 NED：
 浏览器导出是当前实时视图快照；任务结束后的服务端权威快照位于运行目录的 `topology_map.json`。
 
 ## 工程架构
+
+<p align="center">
+  <img src="docs/images/architecture-v1.png" alt="空界智语无人机视觉语言导航平台 v1 技术架构图" width="100%">
+</p>
+
+<p align="center"><em>v1 总体技术架构：Web 可视化、FastAPI 控制平面、VLM 服务、Python 3.7 JSONL 兼容桥和 UE4.27/AirSim 仿真层。</em></p>
+
+### 运行组件与数据流
 
 ```mermaid
 flowchart LR
