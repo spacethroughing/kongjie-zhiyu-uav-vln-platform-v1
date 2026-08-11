@@ -5,7 +5,7 @@
       "name": "Mock E2E（无需 UE）",
       "mode": "mock",
       "vehicle_name": "Drone1",
-      "manual_safety_bounds": {"x_min": -30, "x_max": 30, "y_min": -30, "y_max": 30},
+      "manual_safety_bounds": {"x_min": -999, "x_max": 999, "y_min": -999, "y_max": 999},
       "zones": [
         {
           "id": "mock-fixture",
@@ -37,15 +37,15 @@
       "settings": "C:\\Users\\Mingyi Liu\\Documents\\Codex\\2026-08-08\\new-chat-2\\outputs\\airsim-llm-harness\\configs\\airsim\\blocks.settings.json",
       "vehicle_name": "Drone1",
       "bridge_conda_env": "airsim",
-      "manual_safety_bounds": {"x_min": -45, "x_max": 45, "y_min": -45, "y_max": 45},
+      "manual_safety_bounds": {"x_min": -999, "x_max": 999, "y_min": -999, "y_max": 999},
       "launch_args": ["-windowed", "-ResX=1280", "-ResY=720", "-NoSound", "-HarnessFixture"],
       "checksum_paths": ["E:\\C\\AirSim\\Unreal\\Environments\\Blocks\\Content\\FlyingCPP\\Maps\\FlyingExampleMap.umap"],
       "zones": [
         {
           "id": "blocks-main",
             "name": "Blocks 主测试区",
-            "polygon": {"points": [[-20, -20], [40, -20], [40, 40], [-20, 40]]},
-            "coverage_polygon": {"points": [[-20, -20], [20, -20], [20, 20], [-20, 20]]},
+            "polygon": {"points": [[-25, -75], [45, -75], [45, 45], [-25, 45]]},
+            "coverage_polygon": {"points": [[-20, -70], [20, -70], [20, 20], [-20, 20]]},
             "search_altitude_m": 5,
             "lane_spacing_m": 8,
             "observation_yaws_deg": [0, 90, 180, 270],
@@ -74,7 +74,8 @@
       "settings": "C:\\Users\\Mingyi Liu\\Documents\\Codex\\2026-08-08\\new-chat-2\\outputs\\airsim-llm-harness\\configs\\airsim\\citypark.settings.json",
       "vehicle_name": "Drone1",
       "bridge_conda_env": "airsim",
-      "manual_safety_bounds": {"x_min": -30, "x_max": 30, "y_min": -30, "y_max": 30},
+      "smoke_cleanup": "reset",
+      "manual_safety_bounds": {"x_min": -999, "x_max": 999, "y_min": -999, "y_max": 999},
       "launch_args": ["-windowed", "-ResX=1280", "-ResY=720", "-NoSound"],
       "checksum_paths": ["D:\\CityParkEnvironmentCollec\\Content\\CityPark\\Maps\\Showcase.umap"],
       "zones": [

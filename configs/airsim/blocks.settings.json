@@ -9,7 +9,8 @@
   "CameraDefaults": {
     "CaptureSettings": [
       {"ImageType": 0, "Width": 640, "Height": 360, "FOV_Degrees": 90, "MotionBlurAmount": 0},
-      {"ImageType": 1, "Width": 640, "Height": 360, "FOV_Degrees": 90, "MotionBlurAmount": 0}
+      {"ImageType": 1, "Width": 640, "Height": 360, "FOV_Degrees": 90, "MotionBlurAmount": 0},
+      {"ImageType": 3, "Width": 640, "Height": 360, "FOV_Degrees": 90, "MotionBlurAmount": 0}
     ]
   },
   "Vehicles": {

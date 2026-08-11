@@ -170,6 +170,7 @@ class MockVehicleAdapter(VehicleAdapter):
 
     def __init__(self) -> None:
         self.position = Vec3(x=0, y=0, z=0)
+        self.yaw_degrees = 0.0
         self.armed = False
         self.landed = True
         self.connected = True
@@ -194,13 +195,32 @@ class MockVehicleAdapter(VehicleAdapter):
             return {"accepted": True}
         if operation == "move_to":
             self.position = Vec3(x=arguments["x"], y=arguments["y"], z=arguments["z"])
+            if arguments.get("yaw_degrees") is not None:
+                self.yaw_degrees = float(arguments["yaw_degrees"])
             return {"accepted": True}
-        if operation in {"hover", "cancel", "rotate_yaw"}:
+        if operation == "move_to_z":
+            self.position = Vec3(
+                x=self.position.x,
+                y=self.position.y,
+                z=arguments["z"],
+            )
+            return {"accepted": True}
+        if operation == "rotate_yaw":
+            self.yaw_degrees = float(arguments["yaw_degrees"])
+            return {"accepted": True}
+        if operation in {"hover", "cancel"}:
             return {"accepted": True}
         if operation == "state":
+            yaw = math.radians(self.yaw_degrees)
             return {
                 "position": self.position.model_dump(),
                 "velocity": {"x": 0, "y": 0, "z": 0},
+                "orientation": {
+                    "w": math.cos(yaw / 2),
+                    "x": 0,
+                    "y": 0,
+                    "z": math.sin(yaw / 2),
+                },
                 "armed": self.armed,
                 "landed": self.landed,
                 "collision": False,

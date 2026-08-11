@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import REPO_ROOT, Settings, load_scenes
 from .events import EventBus
+from .geometry import quaternion_yaw_degrees
 from .llm import create_provider
 from .mission import MissionError, MissionService
 from .models import (
@@ -19,6 +20,7 @@ from .models import (
     CandidateDecision,
     HealthResponse,
     MissionPlan,
+    MissionPlanRevisionRequest,
     ProviderConfigRequest,
     ProviderConfigResponse,
     ProviderModelOption,
@@ -27,6 +29,8 @@ from .models import (
     SearchMissionRequest,
     SimulatorStartRequest,
     TERMINAL_STATES,
+    VlmChatRequest,
+    VlmChatResponse,
 )
 from .simulator import SimulatorError, SimulatorManager
 from .store import Store
@@ -49,6 +53,7 @@ class ApplicationServices:
         self.simulator = SimulatorManager(self.profiles, self.events)
         self.provider = create_provider(self.settings)
         self.provider_config_lock = asyncio.Lock()
+        self.vlm_chat_lock = asyncio.Lock()
         self.missions = MissionService(
             self.settings, self.store, self.events, self.simulator, self.provider
         )
@@ -154,7 +159,11 @@ async def lifespan(app: FastAPI):
     await services.close()
 
 
-app = FastAPI(title="AirSim LLM Harness", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="空界智语—无人机视觉语言导航平台",
+    version="0.1.0",
+    lifespan=lifespan,
+)
 
 
 def services() -> ApplicationServices:
@@ -259,6 +268,23 @@ async def plan_mission(request: SearchMissionRequest) -> MissionPlan:
         raise HTTPException(status_code=422, detail=str(error)) from error
 
 
+@app.patch("/api/missions/{plan_id}", response_model=MissionPlan)
+async def revise_mission_plan(
+    plan_id: str,
+    request: MissionPlanRevisionRequest,
+) -> MissionPlan:
+    try:
+        return services().missions.revise_plan(
+            plan_id,
+            request.base_version,
+            request.parameters,
+        )
+    except MissionError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
 @app.post("/api/missions/{plan_id}/approve", response_model=RunRecord)
 async def approve_mission(plan_id: str) -> RunRecord:
     try:
@@ -319,6 +345,190 @@ async def run_control(run_id: str, action: str) -> RunRecord:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
+@app.post("/api/vlm/chat", response_model=VlmChatResponse)
+async def vlm_chat(request: VlmChatRequest) -> VlmChatResponse:
+    service = services()
+    requested_run = service.store.get_run(request.run_id) if request.run_id else None
+    if request.run_id and requested_run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    active_runs = service.active_runs()
+    active_run = next(
+        (run for run in active_runs if run.id == request.run_id),
+        active_runs[0] if active_runs and request.run_id is None else None,
+    )
+    context_run = requested_run or active_run
+    context_plan = (
+        service.store.get_plan(context_run.plan_id) if context_run else None
+    )
+    context_target_text = (
+        context_plan.request.target_text
+        if active_run is not None and context_plan is not None
+        else request.target_text
+    )
+    map_snapshot = service.simulator.mapper.snapshot(include_tentative_semantics=True)
+    semantic_objects = [
+        node
+        for node in map_snapshot.get("nodes", [])
+        if node.get("kind") == "object"
+    ][-20:]
+    telemetry = service.simulator.latest_telemetry
+    frame = service.simulator.latest_frame if request.include_frame else None
+    camera_yaw_degrees = (
+        quaternion_yaw_degrees(frame.camera_orientation) if frame else None
+    )
+    context = {
+        "simulator_state": service.simulator.state,
+        "scene_id": (
+            service.simulator.active_profile.id
+            if service.simulator.active_profile
+            else None
+        ),
+        "run_id": context_run.id if context_run else None,
+        "run_state": context_run.state.value if context_run else None,
+        "target_text": context_target_text,
+        "target_text_source": "approved_mission" if active_run else "web_input",
+        "camera_yaw_degrees": camera_yaw_degrees,
+        "target_position": (
+            context_run.target_position.model_dump(mode="json")
+            if context_run and context_run.target_position
+            else None
+        ),
+        "telemetry": telemetry.model_dump(mode="json") if telemetry else None,
+        "map": {
+            "stats": map_snapshot["stats"],
+            "semantic_objects": semantic_objects,
+        },
+    }
+    async with service.vlm_chat_lock:
+        try:
+            decision = await service.provider.chat(
+                request.message, context, request.history, frame
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=424,
+                detail=f"VLM chat failed: {type(error).__name__}: {error}",
+            ) from error
+
+    executed_action = None
+    command_error = None
+    command_status = "none"
+    mission_plan = None
+    if decision.mission and request.execute_command:
+        if active_run is not None:
+            command_error = "活动任务执行中不能替换不可变任务计划，请先完成或终止当前任务"
+            command_status = "rejected"
+        else:
+            scene_id = request.scene_id or context.get("scene_id")
+            profile = service.simulator.profiles.get(scene_id or "")
+            zone_id = request.zone_id or (profile.zones[0].id if profile and profile.zones else None)
+            if not scene_id or not profile:
+                command_error = "自然语言任务缺少有效仿真场景"
+                command_status = "rejected"
+            elif not zone_id:
+                command_error = "自然语言任务缺少有效搜索区域"
+                command_status = "rejected"
+            else:
+                try:
+                    mission = decision.mission
+                    target_text = (
+                        "、".join(mission.targets)
+                        if mission.kind == "target_search"
+                        else "给定区域占据与语义拓扑图"
+                    )
+                    mission_plan = service.missions.create_plan(
+                        SearchMissionRequest(
+                            scene_id=scene_id,
+                            zone_id=zone_id,
+                            target_text=target_text,
+                            mission_mode=mission.kind,
+                            targets=mission.targets,
+                            mapping_coverage_target=mission.coverage_target,
+                            end_policy=(
+                                request.end_policy
+                                if mission.kind == "target_search"
+                                else "auto_rth"
+                            ),
+                            safety_bounds=request.safety_bounds,
+                        )
+                    )
+                    context_target_text = mission_plan.request.target_text
+                    command_status = "planned"
+                except (MissionError, ValueError) as error:
+                    command_error = str(error)
+                    command_status = "rejected"
+    if decision.action and request.execute_command:
+        if active_run is None:
+            command_error = "没有可执行该指令的活动任务"
+            command_status = "rejected"
+        else:
+            try:
+                if decision.action == "explore":
+                    assert decision.heading_degrees is not None
+                    assert decision.distance_m is not None
+                    await service.missions.queue_exploration(
+                        active_run.id,
+                        decision.heading_degrees,
+                        decision.distance_m,
+                    )
+                    command_status = "queued"
+                elif decision.action == "change-altitude":
+                    await service.missions.queue_altitude(
+                        active_run.id,
+                        altitude_delta_m=decision.altitude_delta_m,
+                        target_altitude_m=decision.target_altitude_m,
+                    )
+                    command_status = "queued"
+                else:
+                    await service.missions.control(active_run.id, decision.action)
+                    command_status = "executed"
+                executed_action = decision.action
+            except MissionError as error:
+                command_error = str(error)
+                command_status = "rejected"
+    await service.events.publish(
+        "vlm.chat",
+        {
+            "message": "VLM 实时对话已响应",
+            "requested_action": decision.action,
+            "executed_action": executed_action,
+            "command_error": command_error,
+            "frame_used": frame is not None,
+            "heading_degrees": decision.heading_degrees,
+            "distance_m": decision.distance_m,
+            "altitude_delta_m": decision.altitude_delta_m,
+            "target_altitude_m": decision.target_altitude_m,
+            "context_target_text": context_target_text,
+            "command_status": command_status,
+            "mission_kind": decision.mission.kind if decision.mission else None,
+            "mission_plan_id": mission_plan.id if mission_plan else None,
+            "task_count": len(mission_plan.tasks) if mission_plan else 0,
+        },
+        active_run.id if active_run else None,
+    )
+    return VlmChatResponse(
+        reply=(
+            f"{decision.reply}\n已生成 {len(mission_plan.tasks)} 步确定性任务计划，请在计划审核区确认后执行。"
+            if mission_plan
+            else decision.reply
+        ),
+        requested_action=decision.action,
+        executed_action=executed_action,
+        command_error=command_error,
+        run_id=active_run.id if active_run else (context_run.id if context_run else None),
+        frame_used=frame is not None,
+        heading_degrees=decision.heading_degrees,
+        distance_m=decision.distance_m,
+        altitude_delta_m=decision.altitude_delta_m,
+        target_altitude_m=decision.target_altitude_m,
+        context_target_text=context_target_text,
+        mission_intent=decision.mission,
+        mission_plan=mission_plan,
+        task_breakdown=mission_plan.tasks if mission_plan else [],
+        command_status=command_status,
+    )
+
+
 @app.websocket("/api/ws")
 async def websocket_events(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -335,6 +545,8 @@ async def websocket_events(websocket: WebSocket) -> None:
                 if service.simulator.active_profile
                 else None,
                 "runs": [run.model_dump(mode="json") for run in service.store.list_runs(10)],
+                "map": service.simulator.mapper.snapshot(),
+                "lidar": service.simulator.latest_lidar,
             },
         }
     )
@@ -358,5 +570,5 @@ async def frontend(full_path: str):
     if index.exists():
         return FileResponse(index)
     return HTMLResponse(
-        "<h1>AirSim LLM Harness</h1><p>Frontend 尚未构建。运行 <code>npm --prefix frontend run build</code>。</p>"
+        "<h1>空界智语—无人机视觉语言导航平台</h1><p>Frontend 尚未构建。运行 <code>npm --prefix frontend run build</code>。</p>"
     )

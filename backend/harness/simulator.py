@@ -6,10 +6,13 @@ import os
 import subprocess
 from pathlib import Path
 
+from .avoidance import decode_point_cloud, point_cloud_preview_payload
 from .bridge import JsonLineBridge, MockVehicleAdapter, VehicleAdapter
 from .config import REPO_ROOT
 from .events import EventBus
-from .models import SceneProfile
+from .geometry import frame_preview_payload
+from .mapping import TopologicalMapper
+from .models import CameraFrame, SceneProfile, Telemetry
 
 
 class SimulatorError(RuntimeError):
@@ -24,6 +27,11 @@ class SimulatorManager:
         self.adapter: VehicleAdapter | None = None
         self.process: asyncio.subprocess.Process | None = None
         self.state = "STOPPED"
+        self.mapper = TopologicalMapper()
+        self.latest_frame: CameraFrame | None = None
+        self.latest_telemetry: Telemetry | None = None
+        self.latest_lidar: dict | None = None
+        self.mission_active = False
         self._lock = asyncio.Lock()
         self._preview_task: asyncio.Task | None = None
 
@@ -39,6 +47,10 @@ class SimulatorManager:
                 raise SimulatorError(f"scene is not allowlisted: {scene_id}") from error
             self.state = "STARTING"
             self.active_profile = profile
+            self.mapper.reset()
+            self.latest_frame = None
+            self.latest_telemetry = None
+            self.latest_lidar = None
             await self.events.publish("simulator.state", {"state": self.state, "scene_id": scene_id})
             try:
                 if profile.mode == "mock":
@@ -152,18 +164,40 @@ class SimulatorManager:
                         await self.adapter.request("arm", timeout=3, armed=False, vehicle_name=vehicle_name)
                         await asyncio.sleep(0.5)
                         await self.adapter.request("arm", timeout=3, armed=True, vehicle_name=vehicle_name)
+                test_altitude_m = min(
+                    profile.safety.max_altitude_m,
+                    max(
+                        profile.safety.min_altitude_m,
+                        profile.zones[0].search_altitude_m,
+                    ),
+                )
+                phase = "climb to smoke altitude"
+                await self.adapter.request(
+                    "move_to",
+                    timeout=25,
+                    vehicle_name=vehicle_name,
+                    x=initial.position.x,
+                    y=initial.position.y,
+                    z=ground_z - test_altitude_m,
+                    speed=min(2.0, profile.safety.max_speed_mps),
+                )
+                airborne = await self._wait_vehicle(
+                    lambda telemetry: not telemetry.landed
+                    and telemetry.position.z <= ground_z - test_altitude_m + 1.2,
+                    vehicle_name,
+                    "smoke altitude",
+                    timeout=30,
+                )
                 phase = "hover"
                 await self.adapter.request("hover", timeout=5, vehicle_name=vehicle_name)
                 phase = "image capture"
                 frame = await self.adapter.capture(vehicle_name)
+                preview_payload = frame_preview_payload(
+                    frame, source="smoke_airborne"
+                )
                 await self.events.publish(
                     "frame.preview",
-                    {
-                        "frame_id": frame.frame_id,
-                        "data_url": f"data:image/png;base64,{frame.scene_png_b64}",
-                        "width": frame.width,
-                        "height": frame.height,
-                    },
+                    preview_payload,
                 )
                 phase = "LiDAR scan"
                 lidar = await self.adapter.request(
@@ -177,26 +211,67 @@ class SimulatorManager:
                     raise SimulatorError("LiDAR is not using the required world NED frame")
                 if int(lidar.get("sampled_point_count", 0)) <= 0:
                     raise SimulatorError("LiDAR returned no obstacle points")
-                phase = "landing"
-                await self.adapter.request("land", timeout=5, vehicle_name=vehicle_name)
-                landed = await self._wait_vehicle(
-                    lambda telemetry: telemetry.landed
-                    or (
-                        abs(telemetry.position.z - ground_z) <= 0.25
-                        and abs(telemetry.velocity.z) <= 0.15
-                    ),
-                    vehicle_name,
-                    "landing",
-                    timeout=65,
+                smoke_lidar_points = decode_point_cloud(lidar.get("point_cloud", []))
+                self.latest_lidar = point_cloud_preview_payload(
+                    smoke_lidar_points, airborne.position
                 )
-                await self.adapter.request("arm", timeout=5, armed=False, vehicle_name=vehicle_name)
-                await asyncio.sleep(0.5)
-                final = await self.adapter.telemetry(vehicle_name)
+                await self.events.publish("lidar.points", self.latest_lidar)
+                if profile.smoke_cleanup == "reset":
+                    # CityPark's stock spawn can be below its water surface;
+                    # SimpleFlight then cannot confirm a normal landing. A
+                    # simulator reset is the deterministic diagnostic cleanup.
+                    phase = "reset cleanup"
+                    await self.adapter.request(
+                        "reset", timeout=8, vehicle_name=vehicle_name
+                    )
+                    await self.adapter.request(
+                        "arm",
+                        timeout=5,
+                        armed=False,
+                        vehicle_name=vehicle_name,
+                    )
+                    await self.adapter.request(
+                        "api_control",
+                        timeout=5,
+                        enabled=False,
+                        vehicle_name=vehicle_name,
+                    )
+                    final = await self._wait_ground_stable(vehicle_name)
+                    landed = final
+                else:
+                    phase = "landing"
+                    await self.adapter.request("land", timeout=5, vehicle_name=vehicle_name)
+                    landed = await self._wait_vehicle(
+                        lambda telemetry: telemetry.landed
+                        or (
+                            abs(telemetry.position.z - ground_z) <= 0.25
+                            and abs(telemetry.velocity.z) <= 0.15
+                        ),
+                        vehicle_name,
+                        "landing",
+                        timeout=65,
+                    )
+                    await self.adapter.request("arm", timeout=5, armed=False, vehicle_name=vehicle_name)
+                    await asyncio.sleep(0.5)
+                    final = await self.adapter.telemetry(vehicle_name)
                 await self.events.publish("telemetry", final.model_dump(mode="json"))
                 result = {
                     "ok": True,
                     "scene_id": profile.id,
-                    "frame": {"width": frame.width, "height": frame.height, "frame_id": frame.frame_id},
+                    "airborne_position": airborne.position.model_dump(mode="json"),
+                    "airborne_altitude_m": ground_z - airborne.position.z,
+                    "frame": {
+                        "width": frame.width,
+                        "height": frame.height,
+                        "frame_id": frame.frame_id,
+                        "depth_source": preview_payload.get("depth_source"),
+                        "depth_metric_valid": preview_payload.get(
+                            "depth_metric_valid"
+                        ),
+                        "depth_min_m": preview_payload.get("depth_min_m"),
+                        "depth_max_m": preview_payload.get("depth_max_m"),
+                        "depth_warning": preview_payload.get("depth_warning"),
+                    },
                     "lidar": {
                         "data_frame": lidar["data_frame"],
                         "point_count": int(lidar.get("point_count", 0)),
@@ -204,6 +279,7 @@ class SimulatorManager:
                     },
                     "ground_contact": landed.landed
                     or abs(landed.position.z - ground_z) <= 0.25,
+                    "cleanup": profile.smoke_cleanup,
                     "telemetry": final.model_dump(mode="json"),
                 }
                 await self.events.publish("simulator.smoke", {"phase": "completed", **result})
@@ -299,12 +375,13 @@ class SimulatorManager:
         )
 
     async def _stream_preview(self, profile: SceneProfile) -> None:
-        """Publish a low-rate live preview while the allowlisted scene is READY."""
+        """Publish RGB/depth preview and a bounded LiDAR topology map."""
         await self.events.publish(
             "system.log",
             {"level": "info", "message": f"{profile.name} 实时预览已启动", "source": "preview"},
         )
         consecutive_failures = 0
+        mapping_failures = 0
         try:
             while (
                 self.state == "READY"
@@ -313,18 +390,56 @@ class SimulatorManager:
             ):
                 try:
                     telemetry = await self.adapter.telemetry(profile.vehicle_name)
+                    self.latest_telemetry = telemetry
+                    self.mapper.integrate_pose(telemetry.position)
                     await self.events.publish("telemetry", telemetry.model_dump(mode="json"))
                     frame = await self.adapter.capture(profile.vehicle_name)
+                    self.latest_frame = frame
                     await self.events.publish(
                         "frame.preview",
-                        {
-                            "frame_id": frame.frame_id,
-                            "data_url": f"data:image/png;base64,{frame.scene_png_b64}",
-                            "width": frame.width,
-                            "height": frame.height,
-                            "source": "live_preview",
-                        },
+                        frame_preview_payload(frame, source="live_preview"),
                     )
+                    if not self.mission_active and telemetry.armed:
+                        try:
+                            scan = await self.adapter.request(
+                                "lidar_scan",
+                                timeout=4,
+                                vehicle_name=profile.vehicle_name,
+                                max_points=1800,
+                            )
+                            if scan.get("data_frame") == "VehicleInertialFrame":
+                                lidar_points = decode_point_cloud(
+                                    scan.get("point_cloud", [])
+                                )
+                                self.mapper.integrate_lidar(
+                                    lidar_points, telemetry.position
+                                )
+                                self.latest_lidar = point_cloud_preview_payload(
+                                    lidar_points, telemetry.position
+                                )
+                                await self.events.publish(
+                                    "lidar.points", self.latest_lidar
+                                )
+                                mapping_failures = 0
+                            else:
+                                raise ValueError("LiDAR map frame is not VehicleInertialFrame")
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as mapping_error:
+                            mapping_failures += 1
+                            if mapping_failures in {1, 3} or mapping_failures % 10 == 0:
+                                await self.events.publish(
+                                    "mapping.sensor_warning",
+                                    {
+                                        "level": "warning",
+                                        "message": (
+                                            "在线建图暂未收到有效 LiDAR："
+                                            f"{type(mapping_error).__name__}: {mapping_error}"
+                                        ),
+                                        "consecutive_failures": mapping_failures,
+                                    },
+                                )
+                    await self.events.publish("map.update", self.mapper.snapshot())
                     consecutive_failures = 0
                 except asyncio.CancelledError:
                     raise

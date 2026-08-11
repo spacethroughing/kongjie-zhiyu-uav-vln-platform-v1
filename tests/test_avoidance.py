@@ -7,6 +7,7 @@ import pytest
 from harness.avoidance import (
     assess_corridor,
     choose_local_detour,
+    point_cloud_preview_payload,
     point_to_segment_distance,
 )
 from harness.bridge import MockVehicleAdapter
@@ -31,6 +32,25 @@ def obstacle_ring(center: Vec3, radius: float = 0.8) -> list[Vec3]:
     ]
 
 
+def test_point_cloud_preview_is_bounded_and_keeps_world_ned_coordinates():
+    vehicle = Vec3(x=5, y=-3, z=-4)
+    points = [
+        Vec3(
+            x=vehicle.x + 10 * math.cos(index * math.tau / 500),
+            y=vehicle.y + 10 * math.sin(index * math.tau / 500),
+            z=-4 + (index % 20) * 0.1,
+        )
+        for index in range(500)
+    ]
+    payload = point_cloud_preview_payload(points, vehicle, max_points=80)
+
+    assert payload["data_frame"] == "VehicleInertialFrame"
+    assert payload["point_count"] == 500
+    assert payload["sampled_point_count"] <= 80
+    assert payload["vehicle_position"] == vehicle.model_dump(mode="json")
+    assert all(len(point) == 3 for point in payload["points"])
+
+
 def test_corridor_detects_obstacle_and_selects_clear_detour():
     start = Vec3(x=0, y=0, z=-5)
     goal = Vec3(x=8, y=0, z=-5)
@@ -50,20 +70,40 @@ def test_corridor_detects_obstacle_and_selects_clear_detour():
     assert not assess_corridor(start, detour.waypoint, points, 1.5).blocked
 
 
-def test_local_detour_fails_closed_when_every_exit_is_occupied():
+def test_local_detour_uses_vertical_escape_when_horizontal_exit_is_occupied():
     start = Vec3(x=0, y=0, z=-5)
     points = obstacle_ring(start, radius=0.5)
-    assert (
-        choose_local_detour(
-            start,
-            Vec3(x=8, y=0, z=-5),
-            points,
-            required_clearance_m=1.5,
-            step_m=4,
-            is_segment_allowed=lambda _start, _end: True,
-        )
-        is None
+    detour = choose_local_detour(
+        start,
+        Vec3(x=8, y=0, z=-5),
+        points,
+        required_clearance_m=1.5,
+        step_m=4,
+        is_segment_allowed=lambda _start, _end: True,
     )
+    assert detour is not None
+    assert detour.waypoint.x == start.x
+    assert detour.waypoint.y == start.y
+    assert detour.waypoint.z < start.z
+    assert not assess_corridor(
+        start,
+        detour.waypoint,
+        points,
+        1.5,
+        allow_escape_from_start=True,
+    ).blocked
+
+
+def test_local_detour_fails_closed_when_vertical_escape_is_disallowed():
+    start = Vec3(x=0, y=0, z=-5)
+    assert choose_local_detour(
+        start,
+        Vec3(x=8, y=0, z=-5),
+        obstacle_ring(start, radius=0.5),
+        required_clearance_m=1.5,
+        step_m=4,
+        is_segment_allowed=lambda _start, end: end.z >= start.z,
+    ) is None
 
 
 def test_local_detour_cost_preserves_heading_continuity_across_replans():
@@ -79,6 +119,39 @@ def test_local_detour_cost_preserves_heading_continuity_across_replans():
     assert detour is not None
     assert detour.side == -1
     assert detour.angle_degrees == -40
+
+
+def test_local_detour_rejects_heading_reversal_and_recent_waypoint_loop():
+    start = Vec3(x=0, y=0, z=-5)
+    goal = Vec3(x=-8, y=0, z=-5)
+    first = choose_local_detour(
+        start,
+        goal,
+        [],
+        required_clearance_m=1.5,
+        step_m=4,
+        is_segment_allowed=lambda _start, _end: True,
+        previous_heading_rad=0.0,
+    )
+    assert first is not None
+    first_heading = math.atan2(first.waypoint.y, first.waypoint.x)
+    assert abs((first_heading + math.pi) % (2 * math.pi) - math.pi) <= math.radians(100)
+
+    second = choose_local_detour(
+        start,
+        goal,
+        [],
+        required_clearance_m=1.5,
+        step_m=4,
+        is_segment_allowed=lambda _start, _end: True,
+        previous_heading_rad=0.0,
+        recent_waypoints=[first.waypoint],
+    )
+    assert second is not None
+    assert math.hypot(
+        second.waypoint.x - first.waypoint.x,
+        second.waypoint.y - first.waypoint.y,
+    ) >= 4 * 0.55
 
 
 class StaticObstacleAdapter(MockVehicleAdapter):

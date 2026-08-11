@@ -1,0 +1,151 @@
+/* RGB/depth sensor pair and live semantic topology overlays. */
+.sensor-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.sensor-grid .video-stage { height: 318px; }
+
+.sensor-badge {
+  position: absolute;
+  z-index: 2;
+  left: 7px;
+  top: 7px;
+  padding: 3px 6px;
+  border: 1px solid #365b79;
+  background: rgba(5, 12, 23, .88);
+  color: #bcefff;
+  font: 8px var(--mono);
+  letter-spacing: .08em;
+}
+
+.depth-stage { background: #000; }
+.depth-scale {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  background: rgba(0, 0, 0, .72);
+  font: 7px var(--mono);
+  color: #dce9f7;
+}
+.depth-scale i {
+  height: 5px;
+  background: linear-gradient(90deg, #8b0000, #ffef00, #13d96b, #00c8ff, #000080);
+}
+.depth-range {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  padding: 3px 5px;
+  background: rgba(0, 0, 0, .72);
+  color: #dce9f7;
+  font: 7px var(--mono);
+}
+.depth-warning {
+  position: absolute;
+  left: 8px;
+  top: 31px;
+  max-width: calc(100% - 16px);
+  padding: 4px 6px;
+  border: 1px solid rgba(244, 201, 93, .5);
+  background: rgba(42, 31, 6, .86);
+  color: #ffe7a8;
+  font: 7px "Microsoft YaHei UI";
+  z-index: 2;
+}
+.depth-warning.invalid {
+  border-color: rgba(255, 107, 107, .65);
+  background: rgba(55, 10, 10, .9);
+  color: #ffd0d0;
+}
+
+.map-panel { height: 340px; }
+.map-wrap { height: 275px; }
+.explored-cell { fill: rgba(77, 159, 216, .34); stroke: rgba(107, 231, 255, .12); stroke-width: .12; pointer-events: none; }
+.occupancy-point { fill: rgba(255, 107, 107, .6); stroke: none; pointer-events: none; }
+.topology-edge { stroke-width: .45; vector-effect: non-scaling-stroke; pointer-events: none; }
+.topology-traversal { stroke: rgba(107, 231, 255, .65); }
+.topology-observed { stroke: rgba(155, 140, 255, .66); stroke-dasharray: 1.5 1; }
+.place-node { fill: #07101d; stroke: var(--ion); stroke-width: .45; vector-effect: non-scaling-stroke; }
+.semantic-node circle { fill: rgba(155, 140, 255, .24); stroke: var(--violet); stroke-width: .65; vector-effect: non-scaling-stroke; }
+.semantic-node text { fill: #dcd5ff; font: 3px "Microsoft YaHei UI"; paint-order: stroke; stroke: #050913; stroke-width: .8px; pointer-events: none; }
+.map-legend { gap: 8px; font-size: 7px; }
+.legend-obstacle { background: rgba(255, 107, 107, .65); border-radius: 5px; }
+.legend-explored { background: rgba(77, 159, 216, .34); border: 1px solid rgba(107, 231, 255, .55); }
+.legend-semantic { border: 1px solid var(--violet); border-radius: 5px; background: rgba(155, 140, 255, .25); }
+.map-stats {
+  position: absolute;
+  right: 8px;
+  bottom: 25px;
+  padding: 4px 6px;
+  background: rgba(3, 7, 15, .84);
+  color: #87a1ba;
+  font: 7px var(--mono);
+  pointer-events: none;
+}
+
+.chat-panel { min-height: 390px; border-top-color: #4b477e; }
+.chat-context { display: flex; gap: 5px; margin: -3px 0 9px; }
+.chat-context span {
+  padding: 3px 5px;
+  border: 1px solid #34435f;
+  background: #080f1b;
+  color: #889bb4;
+  font: 7px var(--mono);
+}
+.chat-context span:last-child { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-messages {
+  height: 205px;
+  overflow-y: auto;
+  padding: 7px;
+  border: 1px solid #233954;
+  background: rgba(4, 9, 18, .76);
+}
+.chat-message { margin-bottom: 8px; }
+.chat-message b { display: block; margin-bottom: 3px; color: #758ba3; font: 7px var(--mono); }
+.chat-message p { margin: 0; color: #afc2d6; font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
+.chat-message small { display: block; margin-top: 4px; color: var(--violet); font: 7px var(--mono); }
+.chat-message .chat-error { color: #ff999c; }
+.chat-task-breakdown { display: grid; gap: 4px; margin-top: 7px; text-align: left; }
+.chat-task-breakdown span {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  padding: 5px 6px;
+  border: 1px solid #393d68;
+  background: rgba(155, 140, 255, .055);
+  color: #c8c2ed;
+  font-size: 8px;
+}
+.chat-task-breakdown span b { margin: 0; color: var(--violet); font: 600 7px var(--mono); }
+.chat-user { padding-left: 20px; text-align: right; }
+.chat-user p { color: #e5eef9; }
+.chat-assistant { padding-right: 12px; }
+.chat-assistant.pending { opacity: .65; animation: chat-pulse 1.2s ease-in-out infinite; }
+.chat-empty { display: grid; place-items: center; min-height: 170px; color: #5b7088; font-size: 9px; line-height: 1.6; text-align: center; }
+.chat-form textarea { margin: 8px 0 6px; resize: none; }
+.chat-actions { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
+.chat-control-toggle { flex-direction: row; align-items: center; gap: 5px; margin: 0; color: #788da5; font-size: 8px; letter-spacing: 0; }
+.chat-control-toggle input { accent-color: var(--ion); }
+.chat-actions button { padding: 6px 13px; }
+@keyframes chat-pulse { 50% { opacity: .35; } }
+
+@media (max-width: 1300px) {
+  .sensor-grid .video-stage { height: 238px; }
+}
+
+@media (max-width: 900px) {
+  .sensor-grid .video-stage { height: 300px; }
+}
+
+@media (max-width: 520px) {
+  .sensor-grid .video-stage { height: 235px; }
+}

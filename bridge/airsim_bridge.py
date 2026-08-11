@@ -36,6 +36,11 @@ def execute_command(task, issued):
                 % (task["x"], task["y"], task["z"]),
                 file=sys.stderr,
             )
+        elif operation == "move_to_z":
+            print(
+                "command issue move_to_z target=%.2f" % task["z"],
+                file=sys.stderr,
+            )
         else:
             print("command issue %s" % operation, file=sys.stderr)
         if operation == "takeoff":
@@ -67,6 +72,16 @@ def execute_command(task, issued):
                 1,
                 vehicle,
             )
+        elif operation == "move_to_z":
+            future = client.moveToZAsync(
+                task["z"],
+                task["speed"],
+                task["timeout"],
+                airsim.YawMode(True, 0),
+                -1,
+                1,
+                vehicle,
+            )
         else:
             raise ValueError("unknown command operation: %s" % operation)
         issued.set()
@@ -92,25 +107,40 @@ class Bridge(object):
         self.camera_name = "front_center"
         self.armed = {}
         self.command_process = None
+        self.command_operation = None
 
     def close(self):
         if self.command_process and self.command_process.is_alive():
             self.command_process.terminate()
             self.command_process.join(2)
+        self.command_operation = None
 
     def _start_command(self, task):
         """Replace the previous flight future and wait only for RPC acceptance."""
         if self.command_process and self.command_process.is_alive():
-            # Mission-side arrival tolerance can be reached just before the
-            # AirSim future resolves. Prefer natural completion; cancelling
-            # every short segment can race with and cancel the next RPC too.
-            self.command_process.join(1)
-            if self.command_process.is_alive():
-                print("command supersede %s" % task["operation"], file=sys.stderr)
-                self._ensure_client().cancelLastTask(task["vehicle_name"])
-                time.sleep(0.2)
+            streaming_handoff = (
+                self.command_operation == "move_to"
+                and task["operation"] == "move_to"
+            )
+            if streaming_handoff:
+                # The previous AirSim goal remains active while the next
+                # Action Chunk is being prepared.  Closing only the worker
+                # that waits on its future avoids a cancel/hover gap; the new
+                # moveToPositionAsync RPC supersedes that goal on the server
+                # and preserves velocity through the handoff.
+                print("command stream handoff move_to", file=sys.stderr)
                 self.command_process.terminate()
-                self.command_process.join(2)
+                self.command_process.join(0.5)
+            else:
+                # Takeoff/land/yaw transitions still require an explicit,
+                # deterministic cancellation boundary.
+                self.command_process.join(1)
+                if self.command_process.is_alive():
+                    print("command supersede %s" % task["operation"], file=sys.stderr)
+                    self._ensure_client().cancelLastTask(task["vehicle_name"])
+                    time.sleep(0.2)
+                    self.command_process.terminate()
+                    self.command_process.join(2)
         issued = multiprocessing.Event()
         process = multiprocessing.Process(target=execute_command, args=(task, issued))
         process.daemon = True
@@ -121,6 +151,7 @@ class Bridge(object):
             raise RuntimeError("AirSim command process did not issue the RPC")
         print("command accepted %s" % task["operation"], file=sys.stderr)
         self.command_process = process
+        self.command_operation = task["operation"]
 
     def _ensure_client(self):
         if self.client is None:
@@ -215,6 +246,20 @@ class Bridge(object):
                 }
             )
             return {"accepted": True}
+        if operation == "move_to_z":
+            z = float(arguments["z"])
+            speed = float(arguments["speed"])
+            timeout = float(arguments.get("timeout", 30))
+            self._start_command(
+                {
+                    "operation": operation,
+                    "vehicle_name": vehicle,
+                    "z": z,
+                    "speed": speed,
+                    "timeout": timeout,
+                }
+            )
+            return {"accepted": True}
         if operation == "state":
             state = client.getMultirotorState(vehicle)
             collision = client.simGetCollisionInfo(vehicle)
@@ -222,6 +267,7 @@ class Bridge(object):
             return {
                 "position": self._vec(state.kinematics_estimated.position),
                 "velocity": self._vec(state.kinematics_estimated.linear_velocity),
+                "orientation": self._quat(state.kinematics_estimated.orientation),
                 "armed": bool(self.armed.get(vehicle, False)),
                 "landed": bool(landed),
                 "collision": bool(collision.has_collided),
@@ -233,16 +279,52 @@ class Bridge(object):
                 [
                     airsim.ImageRequest(camera_name, airsim.ImageType.Scene, False, True),
                     airsim.ImageRequest(camera_name, airsim.ImageType.DepthPlanar, True, False),
+                    airsim.ImageRequest(camera_name, airsim.ImageType.DepthVis, False, False),
                 ],
                 vehicle,
             )
-            if len(responses) != 2:
+            if len(responses) != 3:
                 raise RuntimeError("AirSim did not return scene and depth images")
-            scene, depth = responses
+            scene, depth, depth_vis = responses
             scene_bytes = bytes(scene.image_data_uint8)
             depth_array = np.asarray(depth.image_data_float, dtype="<f4")
             if depth_array.size != int(depth.width) * int(depth.height):
                 raise RuntimeError("AirSim depth image has an unexpected shape")
+            depth_source = "depth-planar"
+            finite_depth = depth_array[np.isfinite(depth_array)]
+            robust_depth_span = (
+                float(
+                    np.percentile(finite_depth, 95)
+                    - np.percentile(finite_depth, 5)
+                )
+                if finite_depth.size
+                else 0.0
+            )
+            depth_is_degenerate = (
+                finite_depth.size == 0
+                or robust_depth_span < 0.05
+            )
+            if depth_is_degenerate:
+                vis_width = int(depth_vis.width)
+                vis_height = int(depth_vis.height)
+                vis_bytes = np.frombuffer(bytes(depth_vis.image_data_uint8), dtype=np.uint8)
+                pixel_count = vis_width * vis_height
+                channels = int(vis_bytes.size / pixel_count) if pixel_count else 0
+                if (
+                    vis_width == int(depth.width)
+                    and vis_height == int(depth.height)
+                    and channels in (3, 4)
+                    and vis_bytes.size == pixel_count * channels
+                ):
+                    # AirSim DepthVis is a documented linear 0..100 m image.
+                    # Some UE scenes clamp the float DepthPlanar post-process to
+                    # 1.0; recover a bounded metric image from DepthVis instead.
+                    depth_array = (
+                        vis_bytes.reshape((vis_height, vis_width, channels))[:, :, 0]
+                        .astype("<f4")
+                        * (100.0 / 255.0)
+                    )
+                    depth_source = "depth-vis-fallback"
             info = client.simGetCameraInfo(camera_name, vehicle)
             return {
                 "frame_id": str(uuid.uuid4()),
@@ -250,6 +332,7 @@ class Bridge(object):
                 "height": int(depth.height),
                 "scene_png_b64": base64.b64encode(scene_bytes).decode("ascii"),
                 "depth_f32_zlib_b64": base64.b64encode(zlib.compress(depth_array.tobytes(), 3)).decode("ascii"),
+                "depth_source": depth_source,
                 "camera_position": self._vec(info.pose.position),
                 "camera_orientation": self._quat(info.pose.orientation),
                 "fov_degrees": float(info.fov),
@@ -292,6 +375,7 @@ class Bridge(object):
             }
         if operation == "reset":
             client.reset()
+            self.armed[vehicle] = False
             return {"accepted": True}
         raise ValueError("unknown operation: %s" % operation)
 

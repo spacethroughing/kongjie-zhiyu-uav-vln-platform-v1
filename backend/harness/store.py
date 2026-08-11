@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -132,21 +133,59 @@ class Store:
         return updated
 
     def append_event(self, event: EventEnvelope) -> None:
+        persisted = event
+        if event.topic == "frame.preview" and "data_url" in event.payload:
+            # The live WebSocket already received the image. Persist only its
+            # frame reference: embedding every PNG again in events.jsonl made
+            # active logs huge and increased Windows read/write lock windows.
+            payload = dict(event.payload)
+            payload.pop("data_url", None)
+            payload.pop("depth_data_url", None)
+            payload["artifact"] = f"frames/{payload.get('frame_id')}.png"
+            persisted = event.model_copy(update={"payload": payload})
+        elif event.topic == "lidar.points" and "points" in event.payload:
+            # Raw point arrays are transient visualization data. Keep only
+            # scan metadata in replay logs to prevent multi-megabyte event
+            # files while the full occupancy result remains in the map export.
+            payload = dict(event.payload)
+            payload.pop("points", None)
+            persisted = event.model_copy(update={"payload": payload})
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT OR REPLACE INTO events(sequence, run_id, topic, timestamp, payload) VALUES(?,?,?,?,?)",
-                (event.sequence, event.run_id, event.topic, event.timestamp.isoformat(), json.dumps(event.payload)),
+                (
+                    persisted.sequence,
+                    persisted.run_id,
+                    persisted.topic,
+                    persisted.timestamp.isoformat(),
+                    json.dumps(persisted.payload),
+                ),
             )
-        if event.run_id:
-            run = self.get_run(event.run_id)
+        if persisted.run_id:
+            run = self.get_run(persisted.run_id)
             if run:
-                self.append_jsonl(Path(run.artifact_dir) / "events.jsonl", event.model_dump(mode="json"))
+                self.append_jsonl(
+                    Path(run.artifact_dir) / "events.jsonl",
+                    persisted.model_dump(mode="json"),
+                )
 
     @staticmethod
     def append_jsonl(path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for attempt in range(101):
+            try:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+                return
+            except PermissionError:
+                if attempt == 100:
+                    raise
+                # Windows readers can briefly deny a concurrent append. Keep
+                # the safety controller alive while a report/artifact reader
+                # releases its handle instead of turning logging into a flight
+                # failure.
+                time.sleep(0.02)
 
     def list_artifacts(self, run_id: str) -> list[str]:
         run = self.get_run(run_id)
@@ -157,6 +196,10 @@ class Store:
 
     def write_manifest(self, run: RunRecord, payload: dict) -> None:
         path = Path(run.artifact_dir) / "manifest.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def write_topology_map(self, run: RunRecord, payload: dict) -> None:
+        path = Path(run.artifact_dir) / "topology_map.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def write_report(self, run: RunRecord, plan: MissionPlan) -> None:
@@ -178,4 +221,3 @@ class Store:
             f"- 错误: {run.error or '-'}\n"
         )
         (root / "report.md").write_text(markdown, encoding="utf-8")
-
