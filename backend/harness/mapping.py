@@ -27,6 +27,14 @@ class _CoverageCell:
 
 
 @dataclass
+class _TraversalCell:
+    x: float
+    y: float
+    visits: int
+    last_seen: float
+
+
+@dataclass
 class _SemanticLandmark:
     id: str
     label: str
@@ -54,6 +62,7 @@ class TopologicalMapper:
         semantic_merge_m: float = 5.0,
         max_cells: int = 1800,
         max_coverage_cells: int = 5000,
+        max_traversal_cells: int = 8000,
         max_places: int = 320,
         max_semantics: int = 120,
     ) -> None:
@@ -63,6 +72,7 @@ class TopologicalMapper:
         self.semantic_merge_m = semantic_merge_m
         self.max_cells = max_cells
         self.max_coverage_cells = max_coverage_cells
+        self.max_traversal_cells = max_traversal_cells
         self.max_places = max_places
         self.max_semantics = max_semantics
         self.reset()
@@ -70,11 +80,13 @@ class TopologicalMapper:
     def reset(self) -> None:
         self._occupancy: dict[tuple[int, int], _OccupancyCell] = {}
         self._coverage: dict[tuple[int, int], _CoverageCell] = {}
+        self._traversal: dict[tuple[int, int], _TraversalCell] = {}
         self._places: list[dict] = []
         self._edges: list[dict] = []
         self._semantics: list[_SemanticLandmark] = []
         self._next_place_id = 1
         self._next_semantic_id = 1
+        self._last_pose: Vec3 | None = None
         self._revision = 0
 
     @staticmethod
@@ -84,9 +96,12 @@ class TopologicalMapper:
     def integrate_pose(self, position: Vec3) -> bool:
         if not all(math.isfinite(value) for value in (position.x, position.y, position.z)):
             return False
+        traversal_changed = self._integrate_traversal(position)
         if self._places:
             previous = Vec3.model_validate(self._places[-1]["position"])
             if self._planar_distance(previous, position) < self.place_spacing_m:
+                if traversal_changed:
+                    self._revision += 1
                 return False
         node_id = f"place-{self._next_place_id}"
         self._next_place_id += 1
@@ -115,6 +130,55 @@ class TopologicalMapper:
             ]
         self._revision += 1
         return True
+
+    def _integrate_traversal(self, position: Vec3) -> bool:
+        """Rasterize the actual vehicle path independently of LiDAR coverage.
+
+        LiDAR rays describe observed space, not where the vehicle has flown.  A
+        separate traversal layer lets the planner penalize true path re-entry
+        without treating every visible free-space cell as a previous visit.
+        """
+        now = time.monotonic()
+        previous = self._last_pose
+        self._last_pose = position
+        positions = [position]
+        if previous is not None:
+            planar = self._planar_distance(previous, position)
+            # Do not draw a long artificial path after a simulator reset,
+            # teleport, or a fixture relocation.
+            if 0.0 < planar <= 20.0:
+                steps = max(1, math.ceil(planar / max(0.5, self.coverage_cell_size_m * 0.5)))
+                positions = [
+                    Vec3(
+                        x=previous.x + (position.x - previous.x) * step / steps,
+                        y=previous.y + (position.y - previous.y) * step / steps,
+                        z=previous.z + (position.z - previous.z) * step / steps,
+                    )
+                    for step in range(1, steps + 1)
+                ]
+        changed = False
+        for sample in positions:
+            key = self._coverage_key(sample)
+            cell = self._traversal.get(key)
+            if cell:
+                cell.visits += 1
+                cell.last_seen = now
+            else:
+                self._traversal[key] = _TraversalCell(
+                    x=(key[0] + 0.5) * self.coverage_cell_size_m,
+                    y=(key[1] + 0.5) * self.coverage_cell_size_m,
+                    visits=1,
+                    last_seen=now,
+                )
+                changed = True
+        if len(self._traversal) > self.max_traversal_cells:
+            keep = sorted(
+                self._traversal.items(),
+                key=lambda item: (item[1].last_seen, item[1].visits),
+                reverse=True,
+            )[: self.max_traversal_cells]
+            self._traversal = dict(keep)
+        return changed
 
     def integrate_lidar(self, points: list[Vec3], vehicle_position: Vec3) -> int:
         now = time.monotonic()
@@ -236,6 +300,63 @@ class TopologicalMapper:
             return 0.0
         observed = sum(key in self._coverage for key in expected)
         return observed / len(expected)
+
+    def segment_exploration_coverage(
+        self,
+        start: Vec3,
+        end: Vec3,
+        *,
+        sample_step_m: float | None = None,
+    ) -> float:
+        """Return the fraction of a candidate segment already observed by LiDAR."""
+        keys = self._segment_keys(start, end, sample_step_m=sample_step_m)
+        if not keys:
+            return 0.0
+        return sum(key in self._coverage for key in keys) / len(keys)
+
+    def trajectory_revisit_ratio(
+        self,
+        start: Vec3,
+        end: Vec3,
+        *,
+        sample_step_m: float | None = None,
+    ) -> float:
+        """Return how much of a candidate segment re-enters the flown path.
+
+        The first cell is excluded because every new command necessarily
+        starts in the vehicle's current, already-visited cell.
+        """
+        keys = self._segment_keys(start, end, sample_step_m=sample_step_m)
+        if len(keys) <= 1:
+            return 0.0
+        future_keys = keys[1:]
+        return sum(key in self._traversal for key in future_keys) / len(future_keys)
+
+    def _segment_keys(
+        self,
+        start: Vec3,
+        end: Vec3,
+        *,
+        sample_step_m: float | None = None,
+    ) -> list[tuple[int, int]]:
+        planar = self._planar_distance(start, end)
+        if planar <= 1e-9:
+            return [self._coverage_key(end)]
+        step_m = sample_step_m or max(0.5, self.coverage_cell_size_m * 0.5)
+        steps = max(1, math.ceil(planar / step_m))
+        keys: list[tuple[int, int]] = []
+        for step in range(steps + 1):
+            ratio = step / steps
+            key = self._coverage_key(
+                Vec3(
+                    x=start.x + (end.x - start.x) * ratio,
+                    y=start.y + (end.y - start.y) * ratio,
+                    z=start.z + (end.z - start.z) * ratio,
+                )
+            )
+            if not keys or key != keys[-1]:
+                keys.append(key)
+        return keys
 
     def coverage_ratio_in_polygon(self, points: list[tuple[float, float]]) -> float:
         """Return the LiDAR-observed fraction of cells inside a world-NED polygon."""
@@ -519,6 +640,11 @@ class TopologicalMapper:
             key=lambda cell: (cell.scans, cell.last_seen),
             reverse=True,
         )[:2500]
+        traversal_cells = sorted(
+            self._traversal.values(),
+            key=lambda cell: (cell.last_seen, cell.visits),
+            reverse=True,
+        )[:2500]
         confirmed_semantics = [item for item in self._semantics if item.observations >= 2]
         visible_semantics = (
             list(self._semantics) if include_tentative_semantics else confirmed_semantics
@@ -545,6 +671,10 @@ class TopologicalMapper:
                 {"x": cell.x, "y": cell.y, "scans": cell.scans}
                 for cell in coverage_cells
             ],
+            "traversed": [
+                {"x": cell.x, "y": cell.y, "visits": cell.visits}
+                for cell in traversal_cells
+            ],
             "coverage_cell_size_m": self.coverage_cell_size_m,
             "nodes": nodes,
             "edges": edges,
@@ -552,6 +682,7 @@ class TopologicalMapper:
                 "occupancy_cells": len(confirmed_cells),
                 "occupancy_tracks": len(self._occupancy),
                 "explored_cells": len(self._coverage),
+                "traversed_cells": len(self._traversal),
                 "place_nodes": len(self._places),
                 "semantic_objects": len(confirmed_semantics),
                 "semantic_tracks": len(self._semantics),

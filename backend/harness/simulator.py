@@ -34,6 +34,7 @@ class SimulatorManager:
         self.mission_active = False
         self._lock = asyncio.Lock()
         self._preview_task: asyncio.Task | None = None
+        self._process_watch_task: asyncio.Task | None = None
 
     async def start(self, scene_id: str) -> SceneProfile:
         async with self._lock:
@@ -74,6 +75,11 @@ class SimulatorManager:
                         stderr=asyncio.subprocess.DEVNULL,
                         creationflags=creationflags,
                     )
+                    launched_process = self.process
+                    self._process_watch_task = asyncio.create_task(
+                        self._watch_process(profile, launched_process),
+                        name=f"simulator-process-{scene_id}",
+                    )
                     self.adapter = JsonLineBridge(REPO_ROOT, profile.bridge_conda_env)
                     await self.adapter.start()
                 await self._wait_ready(profile)
@@ -110,17 +116,76 @@ class SimulatorManager:
         assert self.adapter
         deadline = asyncio.get_running_loop().time() + timeout
         last_error: Exception | None = None
+        consecutive_ready_checks = 0
+        required_ready_checks = 2 if self.process else 1
         while asyncio.get_running_loop().time() < deadline:
             if self.process and self.process.returncode is not None:
                 raise SimulatorError(f"Unreal process exited with code {self.process.returncode}")
             try:
                 result = await self.adapter.request("connect", timeout=3, vehicle_name=profile.vehicle_name)
-                if result.get("connected"):
-                    return
+                vehicles = list(result.get("vehicles") or [])
+                if result.get("connected") and profile.vehicle_name in vehicles:
+                    consecutive_ready_checks += 1
+                    if consecutive_ready_checks >= required_ready_checks:
+                        if self.process and self.process.returncode is not None:
+                            raise SimulatorError(
+                                f"Unreal process exited with code {self.process.returncode}"
+                            )
+                        return
+                else:
+                    consecutive_ready_checks = 0
+                    last_error = SimulatorError(
+                        f"AirSim connected without expected vehicle {profile.vehicle_name!r}; "
+                        f"available vehicles: {vehicles}"
+                    )
             except Exception as error:
+                consecutive_ready_checks = 0
                 last_error = error
             await asyncio.sleep(2)
         raise SimulatorError(f"AirSim RPC did not become ready: {last_error}")
+
+    async def _watch_process(
+        self,
+        profile: SceneProfile,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        """Clear a stale READY state when the Unreal window/process exits."""
+        return_code = await process.wait()
+        async with self._lock:
+            if self.process is not process or self.state == "STOPPED":
+                return
+            preview_task, self._preview_task = self._preview_task, None
+            if preview_task:
+                preview_task.cancel()
+                await asyncio.gather(preview_task, return_exceptions=True)
+            adapter, self.adapter = self.adapter, None
+            if adapter:
+                await adapter.close()
+            self.process = None
+            self.active_profile = None
+            self.latest_frame = None
+            self.latest_telemetry = None
+            self.latest_lidar = None
+            self.mission_active = False
+            self.state = "STOPPED"
+            message = (
+                f"{profile.name} exited unexpectedly with code {return_code}; "
+                "the simulator was disconnected instead of remaining falsely READY"
+            )
+            await self.events.publish(
+                "system.log",
+                {"level": "error", "message": message, "source": "simulator"},
+            )
+            await self.events.publish(
+                "simulator.state",
+                {
+                    "state": self.state,
+                    "scene_id": profile.id,
+                    "reason": "process_exited",
+                    "return_code": return_code,
+                    "error": message,
+                },
+            )
 
     async def stop(self, hard: bool = False) -> None:
         async with self._lock:
@@ -368,6 +433,16 @@ class SimulatorManager:
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
+        process_watch_task, self._process_watch_task = (
+            self._process_watch_task,
+            None,
+        )
+        if (
+            process_watch_task
+            and process_watch_task is not asyncio.current_task()
+        ):
+            process_watch_task.cancel()
+            await asyncio.gather(process_watch_task, return_exceptions=True)
         self.active_profile = None
         self.state = "STOPPED"
         await self.events.publish(

@@ -121,6 +121,22 @@ def test_local_detour_cost_preserves_heading_continuity_across_replans():
     assert detour.angle_degrees == -40
 
 
+def test_local_detour_prefers_an_unflown_corridor():
+    detour = choose_local_detour(
+        Vec3(x=0, y=0, z=-5),
+        Vec3(x=8, y=0, z=-5),
+        [],
+        required_clearance_m=1.5,
+        step_m=4,
+        is_segment_allowed=lambda _start, _end: True,
+        # The otherwise-preferred right candidate re-enters the old path.
+        segment_revisit_cost=lambda _start, end: 1.0 if end.y > 0 else 0.0,
+    )
+    assert detour is not None
+    assert detour.side == -1
+    assert detour.revisit_ratio == 0.0
+
+
 def test_local_detour_rejects_heading_reversal_and_recent_waypoint_loop():
     start = Vec3(x=0, y=0, z=-5)
     goal = Vec3(x=-8, y=0, z=-5)

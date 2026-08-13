@@ -58,6 +58,7 @@ export type Scene = {
 export type MissionPlan = {
   id: string;
   version: number;
+  approved_at?: string | null;
   request: {
     scene_id: string;
     zone_id: string;

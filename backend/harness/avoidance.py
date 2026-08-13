@@ -20,6 +20,7 @@ class Detour:
     side: int
     angle_degrees: float
     minimum_clearance_m: float | None
+    revisit_ratio: float = 0.0
 
 
 def decode_point_cloud(values: Iterable[float]) -> list[Vec3]:
@@ -162,6 +163,7 @@ def choose_local_detour(
     preferred_side: int | None = None,
     previous_heading_rad: float | None = None,
     recent_waypoints: Iterable[Vec3] = (),
+    segment_revisit_cost: Callable[[Vec3, Vec3], float] | None = None,
 ) -> Detour | None:
     """Choose a short collision-free sidestep; the caller rescans after it.
 
@@ -180,7 +182,11 @@ def choose_local_detour(
     distance_to_goal = math.sqrt(
         dx * dx + dy * dy + (goal.z - start.z) * (goal.z - start.z)
     )
-    angle_magnitudes = (40.0, 55.0, 70.0, 90.0, 110.0)
+    # A 110-degree candidate looked like a recovery option but repeatedly sent
+    # the vehicle back into the corridor it had just mapped. A local sidestep
+    # may turn at most 90 degrees; a true deadlock fails closed and lets the
+    # mission-level frontier planner choose another goal.
+    angle_magnitudes = (40.0, 55.0, 70.0, 90.0)
     sides = (
         (preferred_side, -preferred_side)
         if preferred_side in (-1, 1)
@@ -222,14 +228,22 @@ def choose_local_detour(
             assessment.minimum_clearance_m or required_clearance_m * 2,
             required_clearance_m * 3,
         )
+        revisit_ratio = min(
+            1.0,
+            max(0.0, segment_revisit_cost(start, waypoint)),
+        ) if segment_revisit_cost else 0.0
         candidates.append(
             (
-                distance_to_goal + climb * 0.6 - clearance_bonus * 0.03,
+                distance_to_goal
+                + climb * 0.6
+                + revisit_ratio * 7.0
+                - clearance_bonus * 0.03,
                 Detour(
                     waypoint=waypoint,
                     side=preferred_side if preferred_side in (-1, 1) else 1,
                     angle_degrees=0.0,
                     minimum_clearance_m=assessment.minimum_clearance_m,
+                    revisit_ratio=revisit_ratio,
                 ),
             )
         )
@@ -287,6 +301,10 @@ def choose_local_detour(
                         for recent in recent_waypoints
                     ):
                         continue
+                    revisit_ratio = min(
+                        1.0,
+                        max(0.0, segment_revisit_cost(start, waypoint)),
+                    ) if segment_revisit_cost else 0.0
                     score = (
                         remaining
                         + abs(angle_degrees) * 0.008
@@ -294,6 +312,7 @@ def choose_local_detour(
                         + heading_change * 0.55
                         + abs(vertical_offset) * 0.4
                         + (step - candidate_step) * 0.08
+                        + revisit_ratio * 7.0
                         - clearance_bonus * 0.03
                     )
                     candidates.append(
@@ -304,6 +323,7 @@ def choose_local_detour(
                                 side=side,
                                 angle_degrees=side * angle_degrees,
                                 minimum_clearance_m=assessment.minimum_clearance_m,
+                                revisit_ratio=revisit_ratio,
                             ),
                         )
                     )

@@ -9,18 +9,26 @@ from harness.config import REPO_ROOT, Settings, load_scenes
 from harness.events import EventBus
 from harness.bridge import MockVehicleAdapter
 from harness.llm import MockProvider, ModelProvider
-from harness.mission import MissionService
+from harness.mission import (
+    MissionError,
+    MissionService,
+    RunControl,
+    SearchGuidanceState,
+    SearchPathBlocked,
+)
 from harness.models import (
     BoundingBox,
     DetectionAssessment,
     RoutePoint,
     RunState,
+    RunRecord,
     SearchMissionRequest,
     TERMINAL_STATES,
     Vec3,
 )
 from harness.simulator import SimulatorManager
 from harness.store import Store
+from harness.planner import resolve_search_zone
 
 
 def test_topology_connector_bridges_a_distant_vlm_goal_with_safe_hops():
@@ -54,6 +62,102 @@ def test_dialog_exploration_heading_uses_ned_north_then_east_convention():
     assert east.x == pytest.approx(10)
     assert east.y == pytest.approx(4)
     assert east.z == origin.z
+
+
+@pytest.mark.asyncio
+async def test_rolling_search_chunk_timeout_skips_waypoint_instead_of_aborting(
+    tmp_path: Path,
+):
+    settings = Settings(
+        host="127.0.0.1",
+        port=8000,
+        scenes_file=REPO_ROOT / "configs" / "scenes.json",
+        data_dir=tmp_path / "data",
+        runs_dir=tmp_path / "runs",
+        provider="mock",
+        llm_base_url="",
+        llm_model="",
+        llm_api_key="",
+        llm_timeout_seconds=10,
+    )
+    events = EventBus()
+    store = Store(settings.data_dir / "test.sqlite3", settings.runs_dir)
+    missions = MissionService(
+        settings,
+        store,
+        events,
+        SimulatorManager(load_scenes(settings.scenes_file), events),
+        MockProvider(),
+    )
+    run = RunRecord(plan_id="plan", artifact_dir=str(tmp_path / "run"))
+
+    with pytest.raises(SearchPathBlocked, match="rolling search chunk"):
+        await missions._wait_position(
+            run,
+            Vec3(x=4, y=0, z=-5),
+            RunControl(),
+            timeout=0,
+            search_guidance=SearchGuidanceState(observation_index=0),
+        )
+
+    with pytest.raises(MissionError, match="requested position"):
+        await missions._wait_position(
+            run,
+            Vec3(x=4, y=0, z=-5),
+            RunControl(),
+            timeout=0,
+        )
+    store.close()
+
+
+def test_frontier_ranker_promotes_an_unflown_safe_connector(tmp_path: Path):
+    settings = Settings(
+        host="127.0.0.1",
+        port=8000,
+        scenes_file=REPO_ROOT / "configs" / "scenes.json",
+        data_dir=tmp_path / "data",
+        runs_dir=tmp_path / "runs",
+        provider="mock",
+        llm_base_url="",
+        llm_model="",
+        llm_api_key="",
+        llm_timeout_seconds=10,
+    )
+    simulator = SimulatorManager(load_scenes(settings.scenes_file), EventBus())
+    store = Store(settings.data_dir / "test.sqlite3", settings.runs_dir)
+    missions = MissionService(settings, store, EventBus(), simulator, MockProvider())
+    plan = missions.create_plan(
+        SearchMissionRequest(
+            scene_id="mock", zone_id="mock-fixture", target_text="red cube"
+        )
+    )
+    zone = resolve_search_zone(simulator.profiles["mock"], plan.request)
+    current = Vec3(x=-8, y=0, z=-5)
+    # Record the east-west corridor as flown, leaving the north-east connector
+    # novel. The first route item is therefore geometrically valid but wasteful.
+    for x in (-8.0, -4.0, 0.0, 4.0, 8.0):
+        simulator.mapper.integrate_pose(Vec3(x=x, y=0, z=-5))
+    route = [
+        (RoutePoint(index=0, position=Vec3(x=8, y=0, z=-5)), Vec3(x=8, y=0, z=-5)),
+        (
+            RoutePoint(index=1, position=Vec3(x=-4, y=10, z=-5)),
+            Vec3(x=-4, y=10, z=-5),
+        ),
+    ]
+
+    ranked, decision = missions._rank_exploration_route(
+        current,
+        route,
+        plan,
+        zone,
+        Vec3(x=0, y=0, z=0),
+        explored_radius=3.5,
+    )
+
+    assert ranked[0][0].index == 1
+    assert decision["route_reordered"] is True
+    assert decision["trajectory_revisit_ratio"] < 0.5
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -608,14 +712,21 @@ async def test_missing_depth_never_approaches_and_returns_not_found(tmp_path: Pa
     current, states = await run_case(tmp_path, MockProvider(), NoDepthAdapter())
     assert current.state == RunState.NOT_FOUND
     assert RunState.APPROACHING.value not in states
+    events = (Path(current.artifact_dir) / "events.jsonl").read_text(encoding="utf-8")
+    assert '"topic":"search.route_replanned"' in events
 
 
 @pytest.mark.asyncio
 async def test_collision_enters_safe_hold(tmp_path: Path):
-    current, states = await run_case(tmp_path, MockProvider(), CollisionAdapter())
+    adapter = CollisionAdapter()
+    current, states = await run_case(tmp_path, MockProvider(), adapter)
     assert current.state == RunState.FAILED
     assert "collision" in (current.error or "").lower()
     assert RunState.SAFE_HOLD.value in states
+    assert adapter.landed is True
+    assert adapter.armed is False
+    events = (Path(current.artifact_dir) / "events.jsonl").read_text(encoding="utf-8")
+    assert '"topic":"flight.emergency_cleanup"' in events
 
 
 @pytest.mark.asyncio

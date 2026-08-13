@@ -343,6 +343,17 @@ export default function App() {
     setPlan(revised);
   }
 
+  async function approvePlan() {
+    if (!plan) throw new Error("计划尚未生成");
+    if (plan.approved_at) throw new Error("该计划已经批准；请从 VLM 对话生成新计划");
+    const approvedRun = await api.approve(plan.id);
+    // Approval freezes the backend plan. Mirror that fact immediately so a
+    // fast failure cannot re-enable the same approval button and submit the
+    // immutable plan a second time.
+    setPlan({ ...plan, approved_at: new Date().toISOString() });
+    setRun(approvedRun);
+  }
+
   async function saveProviderConfig() {
     const configured = await api.configureProvider(selectedModel, apiKey.trim() || undefined);
     setProviderConfig(configured);
@@ -665,7 +676,7 @@ export default function App() {
                 {plan.tasks.map((task, index) => <div key={task.id}><b>{String(index + 1).padStart(2, "0")}</b><span>{task.label}</span><small>{task.kind === "semantic_mapping" ? `覆盖率目标 ${Math.round((task.coverage_target ?? .85) * 100)}%` : "独立视觉查询"}</small></div>)}
               </div>
               <ul>{plan.safety_summary.map((item) => <li key={item}>{item}</li>)}</ul>
-              <button className="approve" disabled={busy || Boolean(active) || simState !== "READY" || planParametersDirty || Boolean(planParametersError)} onClick={() => act(async () => setRun(await api.approve(plan.id)))}>批准并执行 v{plan.version}</button>
+              <button className="approve" disabled={busy || Boolean(active) || Boolean(plan.approved_at) || simState !== "READY" || planParametersDirty || Boolean(planParametersError)} onClick={() => act(approvePlan)}>{plan.approved_at ? `已批准 v${plan.version}` : `批准并执行 v${plan.version}`}</button>
             </> : <div className="empty">生成计划后，必须在此审核安全摘要才能起飞。</div>}
           </article>
         </aside>
@@ -739,7 +750,7 @@ export default function App() {
             <div className={`state-card state-${currentState.toLowerCase()}`}><small>CURRENT STATE</small><strong>{currentState}</strong><code>{active ? run.id.slice(0, 13) : run ? `历史 ${run.state} · ${run.id.slice(0, 13)}` : "no active run"}</code></div>
             {run?.task_progress?.length ? <div className="run-task-progress" aria-label="复合任务执行进度">
               {run.task_progress.map((task, index) => <div className={`task-${task.state}`} key={task.task_id}>
-                <b>{index + 1}</b><span>{task.label}</span><small>{task.coverage_ratio !== undefined ? `${Math.round(task.coverage_ratio * 100)}%` : task.state}</small>
+                <b>{index + 1}</b><span>{task.label}</span><small>{task.coverage_ratio != null ? `${Math.round(task.coverage_ratio * 100)}%` : task.state}</small>
               </div>)}
             </div> : null}
             <div className="controls">
