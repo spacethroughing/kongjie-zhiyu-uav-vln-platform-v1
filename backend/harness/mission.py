@@ -538,12 +538,12 @@ class MissionService:
         except Exception as error:
             run = self.store.get_run(run.id) or run
             run = await self._set_state(run, RunState.SAFE_HOLD, error=str(error))
-            try:
-                await adapter.request("cancel", timeout=2, vehicle_name=profile.vehicle_name)
-                await adapter.request("hover", timeout=2, vehicle_name=profile.vehicle_name)
-                await adapter.request("land", timeout=2, vehicle_name=profile.vehicle_name)
-            except Exception:
-                pass
+            await self._emergency_land_and_release(
+                run,
+                control,
+                profile.vehicle_name,
+                ground_z=control.home_position.z if control.home_position else None,
+            )
             run = await self._set_state(run, RunState.FAILED, error=str(error), ended=True)
         finally:
             self.simulator.mission_active = False
@@ -551,6 +551,62 @@ class MissionService:
             self.store.write_topology_map(current, self.simulator.mapper.snapshot())
             self.store.write_report(current, plan)
             self._tasks.pop(run.id, None)
+
+    async def _emergency_land_and_release(
+        self,
+        run: RunRecord,
+        control: RunControl,
+        vehicle_name: str,
+        *,
+        ground_z: float | None,
+    ) -> None:
+        """Land after a fault and release SimpleFlight control when grounded."""
+        adapter = self.simulator.adapter
+        if not adapter:
+            return
+        landed = False
+        cleanup_error: str | None = None
+        try:
+            await adapter.request("cancel", timeout=3, vehicle_name=vehicle_name)
+            await adapter.request("land", timeout=5, vehicle_name=vehicle_name)
+            await self._wait_landed(
+                run,
+                control,
+                timeout=45,
+                ignore_controls=True,
+                ignore_collision=True,
+                ground_z=ground_z,
+            )
+            landed = True
+        except Exception as error:
+            cleanup_error = f"{type(error).__name__}: {error}"
+        if landed:
+            try:
+                await adapter.request(
+                    "arm", timeout=5, vehicle_name=vehicle_name, armed=False
+                )
+                await adapter.request(
+                    "api_control",
+                    timeout=5,
+                    vehicle_name=vehicle_name,
+                    enabled=False,
+                )
+            except Exception as error:
+                cleanup_error = cleanup_error or f"{type(error).__name__}: {error}"
+        await self._event(
+            "flight.emergency_cleanup",
+            {
+                "landed": landed,
+                "disarmed": landed and cleanup_error is None,
+                "error": cleanup_error,
+                "message": (
+                    "Fault cleanup landed, disarmed and released API control"
+                    if landed and cleanup_error is None
+                    else "Fault cleanup could not fully confirm landing and disarm"
+                ),
+            },
+            run.id,
+        )
 
     async def _execute_target_search(
         self,
@@ -964,14 +1020,17 @@ class MissionService:
             if not self.simulator.mapper.is_explored(item[1], explored_radius)
         ]
         explored_route = [item for item in world_route if item not in unexplored_route]
-        # Preserve the planner's continuous swath order. Mapped waypoints are
-        # skipped in place below; grouping every unmapped point ahead of every
-        # mapped point would splice distant swaths together and cause the
-        # cross-map reversals that the coverage planner is designed to avoid.
+        # Keep the boustrophedon route as the safe fallback, but allow the
+        # deterministic frontier scorer to promote a nearby, higher-gain
+        # waypoint.  This is deliberately local: it cannot splice a distant
+        # swath into the next command or bypass the geofence validator.
         ordered_route = world_route
         ordered_route = await self._vlm_prioritize_topology_route(
             run, plan, zone, home, ordered_route, explored_radius
         )
+        initial_route_reordered = [item[0].index for item in ordered_route] != [
+            item[0].index for item in world_route
+        ]
         search_task = asyncio.create_task(
             self._stream_vlm_search(run, plan, zone, home, state, stop_search),
             name=f"vlm-search-{run.id}",
@@ -983,15 +1042,15 @@ class MissionService:
                 "route_points": len(ordered_route),
                 "topology_unexplored_first": len(unexplored_route),
                 "topology_deferred_visited": len(explored_route),
-                "route_order": "continuous_boustrophedon",
-                "global_route_reordering": False,
+                "route_order": "adaptive_frontier_gain_with_boustrophedon_fallback",
+                "global_route_reordering": initial_route_reordered,
                 "radar_explored_cells": self.simulator.mapper.snapshot()["stats"][
                     "explored_cells"
                 ],
                 "segment_limit_m": plan.safety.avoidance_segment_m,
                 "message": (
-                    "Panorama found no target; mapped points are skipped in-place and "
-                    "VLM chooses only within a continuous local lookahead window"
+                    "Panorama found no target; mapped points are skipped and each "
+                    "completed or blocked leg triggers a bounded frontier replan"
                 ),
             },
             run.id,
@@ -1127,7 +1186,13 @@ class MissionService:
                         break
                     except SearchPathBlocked as error:
                         waypoint_blocked = True
-                        planner_state = LocalPlannerState()
+                        # Clear obstacle-side hysteresis after abandoning this
+                        # goal, but preserve the last actual flight heading so
+                        # the next frontier scorer does not immediately choose
+                        # a 180-degree return into the blocked corridor.
+                        planner_state = LocalPlannerState(
+                            last_heading_rad=planner_state.last_heading_rad
+                        )
                         await adapter.request(
                             "cancel", vehicle_name=profile.vehicle_name, timeout=3
                         )
@@ -1150,8 +1215,32 @@ class MissionService:
                     await asyncio.sleep(0)
                 if return_requested or state.target is not None:
                     break
-                if waypoint_blocked:
-                    continue
+                if pending_route:
+                    replan_telemetry = await self._telemetry(
+                        run, plan=plan, zone=zone, home=home
+                    )
+                    pending_route, replan = self._rank_exploration_route(
+                        replan_telemetry.position,
+                        pending_route,
+                        plan,
+                        zone,
+                        home,
+                        explored_radius,
+                        planner_state.last_heading_rad,
+                    )
+                    await self._event(
+                        "search.route_replanned",
+                        {
+                            **replan,
+                            "trigger": "blocked" if waypoint_blocked else "waypoint_completed",
+                            "remaining_waypoints": len(pending_route),
+                            "message": (
+                                "Re-ranked nearby frontiers using endpoint gain, segment "
+                                "coverage and actual trajectory revisit cost"
+                            ),
+                        },
+                        run.id,
+                    )
         finally:
             stop_search.set()
             if search_task:
@@ -1425,6 +1514,119 @@ class MissionService:
             await asyncio.sleep(0.2)
         raise SearchPathBlocked("vehicle did not reach the requested altitude before timeout")
 
+    def _rank_exploration_route(
+        self,
+        current: Vec3,
+        route: list[tuple[RoutePoint, Vec3]],
+        plan: MissionPlan,
+        zone: SearchZone,
+        home: Vec3,
+        explored_radius: float,
+        previous_heading_rad: float | None = None,
+    ) -> tuple[list[tuple[RoutePoint, Vec3]], dict]:
+        """Promote one nearby frontier using deterministic map-aware costs.
+
+        Endpoint coverage alone cannot prevent an unexplored waypoint from
+        being reached through a repeatedly flown corridor.  Candidate scores
+        therefore include LiDAR coverage along the complete connector and a
+        separate actual-trajectory revisit ratio.  Only a bounded local window
+        is considered and every promoted connector must remain in the safety
+        envelope.
+        """
+        if len(route) <= 1:
+            selected_id = f"route-{route[0][0].index}" if route else None
+            return route, {
+                "selected_waypoint_id": selected_id,
+                "route_reordered": False,
+                "candidate_count": len(route),
+            }
+
+        mapper = self.simulator.mapper
+        max_connector_m = max(12.0, min(28.0, zone.lane_spacing_m * 3.0))
+        candidate_window = min(len(route), 10)
+        candidates: list[dict] = []
+        for pending_index, (route_point, point) in enumerate(route[:candidate_window]):
+            connector_m = math.hypot(point.x - current.x, point.y - current.y)
+            if pending_index > 0 and connector_m > max_connector_m:
+                continue
+            if not self._segment_is_allowed(current, point, home, zone, plan):
+                continue
+            endpoint_coverage = mapper.exploration_coverage(point, explored_radius)
+            segment_coverage = mapper.segment_exploration_coverage(current, point)
+            revisit_ratio = mapper.trajectory_revisit_ratio(current, point)
+            heading_change = 0.0
+            if previous_heading_rad is not None and connector_m > 1e-6:
+                heading = math.atan2(point.y - current.y, point.x - current.x)
+                heading_change = abs(
+                    (heading - previous_heading_rad + math.pi) % (2 * math.pi) - math.pi
+                )
+            # Actual path re-entry is the strongest penalty. LiDAR coverage is
+            # weaker because a visible free cell may never have been traversed.
+            # A small order penalty preserves sweep continuity when candidates
+            # have similar information gain.
+            score = (
+                endpoint_coverage * 16.0
+                + segment_coverage * 7.0
+                + revisit_ratio * 22.0
+                + connector_m * 0.16
+                + heading_change * 2.2
+                + pending_index * 0.4
+            )
+            candidates.append(
+                {
+                    "pending_index": pending_index,
+                    "waypoint_id": f"route-{route_point.index}",
+                    "score": score,
+                    "endpoint_coverage": endpoint_coverage,
+                    "segment_coverage": segment_coverage,
+                    "trajectory_revisit_ratio": revisit_ratio,
+                    "connector_m": connector_m,
+                    "heading_change_degrees": math.degrees(heading_change),
+                }
+            )
+        if not candidates:
+            return route, {
+                "selected_waypoint_id": f"route-{route[0][0].index}",
+                "route_reordered": False,
+                "candidate_count": 0,
+                "reason": "no_safe_local_frontier",
+            }
+        scored_candidate_count = len(candidates)
+        forward_candidates = [
+            item
+            for item in candidates
+            if previous_heading_rad is None
+            or item["heading_change_degrees"] <= 100.0
+        ]
+        heading_reversal_deferred = bool(forward_candidates) and len(
+            forward_candidates
+        ) < len(candidates)
+        if forward_candidates:
+            candidates = forward_candidates
+        selected = min(candidates, key=lambda item: (item["score"], item["pending_index"]))
+        selected_index = int(selected["pending_index"])
+        reordered = list(route)
+        if selected_index > 0:
+            selected_item = reordered.pop(selected_index)
+            reordered.insert(0, selected_item)
+        return reordered, {
+            "selected_waypoint_id": selected["waypoint_id"],
+            "route_reordered": selected_index > 0,
+            "candidate_count": len(candidates),
+            "scored_candidate_count": scored_candidate_count,
+            "heading_reversal_deferred": heading_reversal_deferred,
+            "score": round(float(selected["score"]), 3),
+            "endpoint_coverage": round(float(selected["endpoint_coverage"]), 3),
+            "segment_coverage": round(float(selected["segment_coverage"]), 3),
+            "trajectory_revisit_ratio": round(
+                float(selected["trajectory_revisit_ratio"]), 3
+            ),
+            "connector_m": round(float(selected["connector_m"]), 2),
+            "heading_change_degrees": round(
+                float(selected["heading_change_degrees"]), 1
+            ),
+        }
+
     async def _vlm_prioritize_topology_route(
         self,
         run: RunRecord,
@@ -1434,12 +1636,11 @@ class MissionService:
         route: list[tuple[RoutePoint, Vec3]],
         explored_radius: float,
     ) -> list[tuple[RoutePoint, Vec3]]:
-        """Ask the VLM for a local exploration goal without reordering the route.
+        """Combine deterministic frontier costs with one bounded VLM preference.
 
-        The deterministic route is an ordered safety contract.  The VLM sees
-        only a bounded, contiguous prefix and may explain which local frontier
-        is most useful; reaching that goal still traverses every preceding
-        swath connector in the original order.
+        The scorer performs the actual safe route promotion. The VLM sees only
+        that bounded candidate set and may promote one of its members when the
+        direct connector is short and remains inside the safety envelope.
         """
         if not route:
             return route
@@ -1467,6 +1668,14 @@ class MissionService:
             == target_category
         ]
         current = await self._telemetry(run, plan=plan, zone=zone, home=home)
+        route, deterministic_replan = self._rank_exploration_route(
+            current.position,
+            route,
+            plan,
+            zone,
+            home,
+            explored_radius,
+        )
         max_lookahead_path_m = max(24.0, min(48.0, zone.lane_spacing_m * 5.0))
         local_route: list[tuple[RoutePoint, Vec3]] = []
         local_path_m = 0.0
@@ -1519,6 +1728,18 @@ class MissionService:
                 "coverage_ratio": round(
                     self.simulator.mapper.exploration_coverage(
                         world_point, explored_radius
+                    ),
+                    3,
+                ),
+                "segment_coverage_ratio": round(
+                    self.simulator.mapper.segment_exploration_coverage(
+                        current.position, world_point
+                    ),
+                    3,
+                ),
+                "trajectory_revisit_ratio": round(
+                    self.simulator.mapper.trajectory_revisit_ratio(
+                        current.position, world_point
                     ),
                     3,
                 ),
@@ -1613,13 +1834,51 @@ class MissionService:
             )
         )
         preferred_index = candidate_ids.index(preferred_goal_id)
-        planned_prefix_ids = candidate_ids[: preferred_index + 1]
+        vlm_reordered = False
+        vlm_rejection_reason = None
+        reordered_route = list(route)
+        if preferred_index > 0:
+            preferred_point = local_route[preferred_index][1]
+            connector_m = math.hypot(
+                preferred_point.x - current.position.x,
+                preferred_point.y - current.position.y,
+            )
+            max_direct_connector_m = max(
+                12.0, min(28.0, zone.lane_spacing_m * 3.0)
+            )
+            seed_revisit = float(candidates[0]["trajectory_revisit_ratio"])
+            preferred_revisit = float(
+                candidates[preferred_index]["trajectory_revisit_ratio"]
+            )
+            if connector_m > max_direct_connector_m:
+                vlm_rejection_reason = "connector_too_long"
+            elif preferred_revisit > seed_revisit + 0.15:
+                vlm_rejection_reason = "connector_revisits_more_flown_space"
+            elif not self._segment_is_allowed(
+                current.position, preferred_point, home, zone, plan
+            ):
+                vlm_rejection_reason = "connector_outside_safety_envelope"
+            else:
+                preferred_route_index = next(
+                    index
+                    for index, (route_point, _point) in enumerate(reordered_route)
+                    if f"route-{route_point.index}" == preferred_goal_id
+                )
+                preferred_item = reordered_route.pop(preferred_route_index)
+                reordered_route.insert(0, preferred_item)
+                vlm_reordered = True
+        planned_prefix_ids = [
+            f"route-{route_point.index}"
+            for route_point, _point in reordered_route[: max(1, preferred_index + 1)]
+        ]
         await self._event(
             "search.topology_vlm_plan",
             {
                 "selected_waypoint_ids": accepted_goal_ids,
                 "preferred_local_goal_id": preferred_goal_id,
-                "connector_waypoint_ids": planned_prefix_ids[:-1],
+                "connector_waypoint_ids": (
+                    [] if vlm_reordered else planned_prefix_ids[:-1]
+                ),
                 "planned_waypoint_ids": planned_prefix_ids,
                 "rejected_waypoint_ids": rejected_ids,
                 "candidate_count": len(candidates),
@@ -1629,14 +1888,22 @@ class MissionService:
                 "initial_target_clue_distance_m": current_clue_distance,
                 "local_lookahead_path_m": round(local_path_m, 2),
                 "max_local_lookahead_path_m": max_lookahead_path_m,
-                "global_route_reordered": False,
+                "deterministic_replan": deterministic_replan,
+                "vlm_preference_applied": vlm_reordered,
+                "vlm_preference_rejection_reason": vlm_rejection_reason,
+                "global_route_reordered": bool(
+                    deterministic_replan.get("route_reordered") or vlm_reordered
+                ),
                 "rationale": decision.rationale,
                 "fallback_appended": len(route) - len(planned_prefix_ids),
-                "message": "VLM 已选择局部探索目标；飞行仍按连续扫描带顺序经过全部连接航点",
+                "message": (
+                    "确定性前沿评分负责选择安全局部航路；只有不增加重访代价且不违反"
+                    "安全包线时，VLM 的局部偏好才会应用到下一航点"
+                ),
             },
             run.id,
         )
-        return route
+        return reordered_route
 
     @staticmethod
     def _topology_connector(
@@ -2333,9 +2600,14 @@ class MissionService:
                     lambda start, end: self._segment_is_allowed(
                         start, end, home, zone, plan
                     ),
-                    planner_state.preferred_side,
-                    planner_state.last_heading_rad,
-                    planner_state.recent_waypoints,
+                    preferred_side=planner_state.preferred_side,
+                    previous_heading_rad=planner_state.last_heading_rad,
+                    recent_waypoints=planner_state.recent_waypoints,
+                    segment_revisit_cost=(
+                        self.simulator.mapper.trajectory_revisit_ratio
+                        if search_guidance is not None
+                        else None
+                    ),
                 )
                 recovery_replan = False
                 if (
@@ -2356,13 +2628,18 @@ class MissionService:
                         lambda start, end: self._segment_is_allowed(
                             start, end, home, zone, plan
                         ),
-                        (
+                        preferred_side=(
                             -planner_state.preferred_side
                             if planner_state.preferred_side in (-1, 1)
                             else None
                         ),
-                        None,
-                        planner_state.recent_waypoints,
+                        previous_heading_rad=None,
+                        recent_waypoints=planner_state.recent_waypoints,
+                        segment_revisit_cost=(
+                            self.simulator.mapper.trajectory_revisit_ratio
+                            if search_guidance is not None
+                            else None
+                        ),
                     )
                 if detour is None:
                     message = (
@@ -2376,7 +2653,9 @@ class MissionService:
                 point = detour.waypoint
                 planner_state.preferred_side = detour.side
                 planner_state.recent_waypoints.append(point)
-                planner_state.recent_waypoints = planner_state.recent_waypoints[-8:]
+                planner_state.recent_waypoints = planner_state.recent_waypoints[
+                    -16 if search_guidance is not None else -8:
+                ]
                 await self._event(
                     "avoidance.recovery" if recovery_replan else "avoidance.detour",
                     {
@@ -2386,6 +2665,7 @@ class MissionService:
                         "angle_degrees": detour.angle_degrees,
                         "observed_clearance_m": detour.minimum_clearance_m,
                         "planned_clearance_m": detour_clearance_m,
+                        "trajectory_revisit_ratio": round(detour.revisit_ratio, 3),
                         "replan": planner_state.consecutive_blocked_replans,
                         "recovery_replans": planner_state.recovery_replans,
                         "planner": "rolling_local_ego_inspired",
@@ -2401,7 +2681,9 @@ class MissionService:
             else:
                 planner_state.consecutive_blocked_replans = 0
                 planner_state.recovery_replans = 0
-                planner_state.recent_waypoints = planner_state.recent_waypoints[-2:]
+                planner_state.recent_waypoints = planner_state.recent_waypoints[
+                    -12 if search_guidance is not None else -2:
+                ]
             validate_position(self._to_home(point, home), zone, plan.safety)
             command_speed = min(
                 speed or plan.safety.max_speed_mps,
@@ -2624,6 +2906,18 @@ class MissionService:
             ):
                 return telemetry
             await asyncio.sleep(0.2)
+        # A rolling search chunk is only one disposable local-planner proposal.
+        # SimpleFlight may fail to converge on a short point (most commonly after
+        # a sharp heading reversal) while the vehicle, telemetry and VLM stream
+        # are all still healthy.  Treating that as a mission-wide fault used to
+        # abort compound searches halfway through their second target.  Let the
+        # search loop cancel the stale command, mark this waypoint unreachable
+        # and re-rank the remaining unexplored frontiers instead.  Approach, RTH
+        # and operator commands retain the stricter mission-failure behaviour.
+        if search_guidance is not None:
+            raise SearchPathBlocked(
+                "rolling search chunk did not converge before timeout"
+            )
         raise MissionError("vehicle did not reach the requested position before timeout")
 
     async def _wait_for_altitude(
@@ -2657,6 +2951,7 @@ class MissionService:
         control: RunControl,
         timeout: float,
         ignore_controls: bool = False,
+        ignore_collision: bool = False,
         ground_z: float | None = None,
     ) -> Telemetry:
         profile = self.simulator.active_profile
@@ -2699,7 +2994,7 @@ class MissionService:
                 and abs(telemetry.position.z - ground_z) <= 1.0
                 and speed <= 0.5
             )
-            if telemetry.collision and not near_ground:
+            if telemetry.collision and not near_ground and not ignore_collision:
                 raise SafetyViolation("AirSim reported a collision")
             if telemetry.landed or near_ground:
                 return telemetry

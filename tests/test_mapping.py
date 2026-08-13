@@ -81,6 +81,35 @@ def test_polygon_coverage_ratio_uses_lidar_observed_cells():
     assert 0 < mapper.coverage_ratio_in_polygon(polygon) <= 1
 
 
+def test_mapper_separates_actual_traversal_from_lidar_observation():
+    mapper = TopologicalMapper(coverage_cell_size_m=2.0, place_spacing_m=4.0)
+    for x in (0.0, 4.0, 8.0):
+        mapper.integrate_pose(Vec3(x=x, y=0, z=-5))
+
+    assert mapper.trajectory_revisit_ratio(
+        Vec3(x=0, y=0, z=-5), Vec3(x=8, y=0, z=-5)
+    ) == 1.0
+    assert mapper.trajectory_revisit_ratio(
+        Vec3(x=8, y=0, z=-5), Vec3(x=16, y=0, z=-5)
+    ) == 0.0
+
+    # A LiDAR ray marks visible free space but must not turn it into a flown
+    # trajectory corridor.
+    mapper.integrate_lidar(
+        [Vec3(x=8, y=10, z=-5)],
+        Vec3(x=8, y=0, z=-5),
+    )
+    assert mapper.segment_exploration_coverage(
+        Vec3(x=8, y=0, z=-5), Vec3(x=8, y=8, z=-5)
+    ) > 0.5
+    assert mapper.trajectory_revisit_ratio(
+        Vec3(x=8, y=0, z=-5), Vec3(x=8, y=8, z=-5)
+    ) == 0.0
+    snapshot = mapper.snapshot()
+    assert snapshot["stats"]["traversed_cells"] == 5
+    assert snapshot["traversed"]
+
+
 def test_semantic_tracks_coalesce_after_filtered_positions_converge():
     mapper = TopologicalMapper()
     first = mapper.integrate_semantic("black cube", Vec3(x=0, y=0, z=-3), 0.8, "a")
